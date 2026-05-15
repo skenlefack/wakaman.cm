@@ -1,0 +1,33 @@
+{
+  "name": "wakaman",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wakaman — Plateforme de livraison Afrique centrale",
+  "workspaces": [
+    "backend",
+    "admin-web",
+    "shared-types"
+  ],
+  "scripts": {
+    "dev:backend": "npm run start:dev --workspace=backend",
+    "dev:admin": "npm run dev --workspace=admin-web",
+    "build:backend": "npm run build --workspace=backend",
+    "build:admin": "npm run build --workspace=admin-web",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "author": "Wakaman Team",
+  "license": "UNLICENSED"
+}

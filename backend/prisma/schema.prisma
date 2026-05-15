@@ -1,0 +1,1078 @@
+// ============================================================
+// WAKAMAN — Schéma Prisma initial
+// ============================================================
+// Plateforme de livraison Afrique centrale
+// PostgreSQL 16 + PostGIS 3.4+
+//
+// Conventions :
+// - IDs : UUID v7 (préfixés par type pour debug : usr_, ord_, etc.)
+// - Timestamps : createdAt, updatedAt sur toutes les tables
+// - Soft delete : deletedAt nullable sur entités principales
+// - Argent : Decimal (pas de Float pour éviter erreurs arrondis)
+// - Devise : FCFA partout (Decimal sans virgule, pas de centimes)
+// ============================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "fullTextSearch"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis(version: "3.4")]
+}
+
+// ============================================================
+// MODULE: USERS & AUTH
+// ============================================================
+
+enum UserType {
+  CLIENT       // Client final (commande)
+  COURIER      // Coursier (livre)
+  MERCHANT     // Marchand (vend)
+  ADMIN        // Personnel Wakaman
+  SUPPORT      // Agent support
+}
+
+enum UserStatus {
+  PENDING      // Inscription en cours
+  ACTIVE       // Compte actif
+  SUSPENDED    // Suspendu temporairement
+  BANNED       // Banni définitivement
+  DELETED      // Soft deleted
+}
+
+enum Language {
+  FR
+  EN
+}
+
+model User {
+  id          String     @id @default(dbgenerated("'usr_' || replace(gen_random_uuid()::text, '-', '')"))
+  phone       String     @unique  // Format E.164 : +237XXXXXXXXX
+  email       String?    @unique
+  passwordHash String?   // Optional : OTP-first
+  type        UserType
+  status      UserStatus @default(PENDING)
+  language    Language   @default(FR)
+
+  // Profil
+  firstName   String?
+  lastName    String?
+  avatarUrl   String?
+  birthDate   DateTime?  @db.Date
+  gender      String?    @db.VarChar(1) // M / F / O
+
+  // Vérification
+  phoneVerifiedAt DateTime?
+  emailVerifiedAt DateTime?
+
+  // Audit
+  lastLoginAt DateTime?
+  lastLoginIp String?
+
+  // Relations
+  client      Client?
+  courier     Courier?
+  merchantUsers MerchantUser[]
+  sessions    Session[]
+  addresses   Address[]
+  notifications Notification[]
+
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  deletedAt   DateTime?
+
+  @@index([phone])
+  @@index([type, status])
+  @@map("users")
+}
+
+model Session {
+  id           String    @id @default(dbgenerated("'ses_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken String    @unique
+  deviceId     String?
+  deviceType   String?   // "android" | "ios" | "web"
+  deviceName   String?   // "Samsung Galaxy A14"
+  appVersion   String?
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([refreshToken])
+  @@map("sessions")
+}
+
+model OTPCode {
+  id        String   @id @default(dbgenerated("'otp_' || replace(gen_random_uuid()::text, '-', '')"))
+  phone     String
+  code      String   // Hashé
+  purpose   String   // "SIGNUP" | "LOGIN" | "RESET_PASSWORD" | "DELIVERY_CONFIRM"
+  attempts  Int      @default(0)
+  verified  Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([phone, purpose])
+  @@map("otp_codes")
+}
+
+// ============================================================
+// MODULE: ADDRESSES (géolocalisation)
+// ============================================================
+
+model Address {
+  id        String    @id @default(dbgenerated("'adr_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id])
+
+  // Adressage Cameroun (pas d'adresse postale fiable)
+  label     String?   // "Maison", "Bureau", "Chez Mama"
+  city      String    // "Douala", "Yaoundé"
+  district  String?   // "Bonapriso", "Bastos"
+  landmark  String    // "Derrière la pharmacie X", "Après le carrefour Y"
+  details   String?   // Détails supplémentaires
+  phoneContact String? // Numéro à appeler (peut être différent du user)
+
+  // Géolocalisation PostGIS
+  latitude  Decimal   @db.Decimal(10, 7)
+  longitude Decimal   @db.Decimal(10, 7)
+  // location  Unsupported("geography(Point, 4326)")? // Pour requêtes spatiales
+
+  isDefault Boolean   @default(false)
+
+  orders    Order[]   @relation("DeliveryAddress")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([city, district])
+  @@map("addresses")
+}
+
+// ============================================================
+// MODULE: CLIENTS
+// ============================================================
+
+model Client {
+  id             String   @id @default(dbgenerated("'cli_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Préférences
+  preferredPaymentMethod PaymentMethod?
+  marketingConsent       Boolean        @default(false)
+
+  // Statistiques (dénormalisées pour perfs)
+  totalOrders     Int     @default(0)
+  totalSpentFcfa  Decimal @default(0) @db.Decimal(12, 0)
+  averageRating   Decimal @default(0) @db.Decimal(2, 1)
+
+  // Programme fidélité
+  loyaltyPoints   Int     @default(0)
+  isPremium       Boolean @default(false)  // Abonnement Wakaman+
+  premiumUntil    DateTime?
+
+  orders          Order[]
+  reviewsGiven    Review[]
+  walletTransactions WalletTransaction[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("clients")
+}
+
+// ============================================================
+// MODULE: COURIERS
+// ============================================================
+
+enum CourierStatus {
+  PENDING_KYC      // KYC en cours
+  ACTIVE           // Actif, peut prendre des courses
+  OFFLINE          // Connecté mais hors-ligne
+  SUSPENDED        // Suspendu
+  BLOCKED          // Bloqué définitivement
+}
+
+enum VehicleType {
+  MOTORCYCLE       // Moto (cas dominant Cameroun)
+  BICYCLE          // Vélo (centre-ville)
+  CAR              // Voiture (rare)
+  ON_FOOT          // À pied (livraisons courtes)
+}
+
+model Courier {
+  id              String        @id @default(dbgenerated("'crr_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId          String        @unique
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // KYC
+  status          CourierStatus @default(PENDING_KYC)
+  idCardNumber    String?       // Numéro CNI
+  idCardFrontUrl  String?
+  idCardBackUrl   String?
+  driverLicenseUrl String?
+  selfieUrl       String?
+
+  // Véhicule
+  vehicleType     VehicleType
+  vehicleBrand    String?       // "Honda CG125"
+  vehiclePlate    String?       // Immatriculation
+  vehiclePhotoUrl String?
+
+  // Position temps réel
+  currentLatitude  Decimal?     @db.Decimal(10, 7)
+  currentLongitude Decimal?     @db.Decimal(10, 7)
+  // currentLocation  Unsupported("geography(Point, 4326)")?
+  lastPositionAt   DateTime?
+  isOnline         Boolean      @default(false)
+  isAvailable      Boolean      @default(false)  // Disponible pour matching
+
+  // Zone d'opération
+  primaryCity      String       // "Douala" | "Yaoundé"
+
+  // Statistiques (dénormalisées)
+  totalDeliveries  Int          @default(0)
+  totalEarningsFcfa Decimal     @default(0) @db.Decimal(12, 0)
+  averageRating    Decimal      @default(0) @db.Decimal(2, 1)
+  acceptanceRate   Decimal      @default(0) @db.Decimal(5, 2)  // % d'acceptation
+
+  // Mobile Money pour retraits
+  momoNumber       String?
+  momoOperator     String?      // "MTN" | "ORANGE"
+
+  orders           Order[]      @relation("AssignedCourier")
+  reviewsReceived  Review[]
+  positionHistory  CourierPosition[]
+  payouts          CourierPayout[]
+
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  @@index([isOnline, isAvailable, primaryCity])
+  @@index([status])
+  @@map("couriers")
+}
+
+// Historique des positions (pour analyse + replay)
+model CourierPosition {
+  id        String   @id @default(dbgenerated("'pos_' || replace(gen_random_uuid()::text, '-', '')"))
+  courierId String
+  courier   Courier  @relation(fields: [courierId], references: [id], onDelete: Cascade)
+  latitude  Decimal  @db.Decimal(10, 7)
+  longitude Decimal  @db.Decimal(10, 7)
+  accuracy  Decimal? @db.Decimal(6, 2)  // Précision GPS en mètres
+  speed     Decimal? @db.Decimal(5, 2)  // m/s
+  bearing   Decimal? @db.Decimal(5, 2)  // Direction
+  orderId   String?  // Si en course
+
+  recordedAt DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([courierId, recordedAt])
+  @@index([orderId])
+  @@map("courier_positions")
+}
+
+// ============================================================
+// MODULE: MERCHANTS
+// ============================================================
+
+enum MerchantType {
+  RESTAURANT
+  SUPERMARKET
+  PHARMACY
+  GROCERY        // Boutique de quartier
+  BAKERY
+  TRADITIONAL_MARKET_VENDOR  // Vendeuse marché (différenciateur Wakaman)
+  OTHER
+}
+
+enum MerchantStatus {
+  PENDING        // En attente de validation
+  ACTIVE
+  PAUSED         // Pause temporaire (fermé manuellement)
+  SUSPENDED
+  CLOSED         // Fermé définitivement
+}
+
+model Merchant {
+  id              String         @id @default(dbgenerated("'mch_' || replace(gen_random_uuid()::text, '-', '')"))
+
+  // Info business
+  businessName    String
+  legalName       String?
+  registrationNumber String?      // Numéro RCCM
+  taxId           String?         // NIU
+  type            MerchantType
+  status          MerchantStatus  @default(PENDING)
+
+  description     String?
+  logoUrl         String?
+  coverUrl        String?
+
+  // Localisation
+  addressLabel    String
+  city            String
+  district        String?
+  landmark        String?
+  latitude        Decimal         @db.Decimal(10, 7)
+  longitude       Decimal         @db.Decimal(10, 7)
+
+  // Contact
+  phonePrimary    String
+  phoneSecondary  String?
+  email           String?
+
+  // Configuration
+  commissionRate  Decimal         @default(20) @db.Decimal(5, 2)  // Pourcentage
+  averagePreparationMinutes Int   @default(20)
+  minimumOrderFcfa Decimal        @default(0) @db.Decimal(12, 0)
+  acceptsCash     Boolean         @default(true)
+  acceptsMomo     Boolean         @default(true)
+
+  // Statistiques (dénormalisées)
+  totalOrders     Int             @default(0)
+  totalRevenueFcfa Decimal        @default(0) @db.Decimal(14, 0)
+  averageRating   Decimal         @default(0) @db.Decimal(2, 1)
+
+  // Mobile Money pour reversements
+  momoNumber      String?
+  momoOperator    String?
+
+  users           MerchantUser[]
+  hours           MerchantHours[]
+  categories      Category[]
+  products        Product[]
+  orders          Order[]
+  reviews         Review[]
+  payouts         MerchantPayout[]
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  deletedAt       DateTime?
+
+  @@index([city, type, status])
+  @@map("merchants")
+}
+
+// Membre d'un merchant (employé)
+model MerchantUser {
+  id         String   @id @default(dbgenerated("'mus_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  role       String   // "OWNER" | "MANAGER" | "STAFF"
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, merchantId])
+  @@map("merchant_users")
+}
+
+// Horaires d'ouverture
+model MerchantHours {
+  id         String   @id @default(dbgenerated("'mhr_' || replace(gen_random_uuid()::text, '-', '')"))
+  merchantId String
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  dayOfWeek  Int      // 0 = dimanche, 6 = samedi
+  openTime   String   // "08:00"
+  closeTime  String   // "22:00"
+  isClosed   Boolean  @default(false)
+
+  @@unique([merchantId, dayOfWeek])
+  @@map("merchant_hours")
+}
+
+// ============================================================
+// MODULE: CATALOG (catégories & produits)
+// ============================================================
+
+model Category {
+  id          String   @id @default(dbgenerated("'cat_' || replace(gen_random_uuid()::text, '-', '')"))
+  merchantId  String
+  merchant    Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  imageUrl    String?
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+
+  products    Product[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([merchantId, isActive])
+  @@map("categories")
+}
+
+model Product {
+  id          String     @id @default(dbgenerated("'prd_' || replace(gen_random_uuid()::text, '-', '')"))
+  merchantId  String
+  merchant    Merchant   @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  categoryId  String?
+  category    Category?  @relation(fields: [categoryId], references: [id])
+
+  name        String
+  description String?
+  imageUrl    String?
+
+  priceFcfa   Decimal    @db.Decimal(12, 0)
+  discountPriceFcfa Decimal? @db.Decimal(12, 0)
+
+  // Disponibilité
+  isAvailable Boolean    @default(true)
+  stock       Int?       // null = stock illimité
+
+  // Métadonnées
+  preparationMinutes Int? // Override merchant default
+  tags        String[]   // Tags libres : "spicy", "vegetarian", etc.
+  allergens   String[]   // Pour pharmacie/restauration
+
+  options     ProductOption[]
+  orderItems  OrderItem[]
+
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  deletedAt   DateTime?
+
+  @@index([merchantId, isAvailable])
+  @@index([categoryId])
+  @@map("products")
+}
+
+// Options/variantes (ex: taille pizza, supplément)
+model ProductOption {
+  id        String   @id @default(dbgenerated("'opt_' || replace(gen_random_uuid()::text, '-', '')"))
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name      String   // "Taille", "Suppléments"
+  type      String   // "SINGLE" | "MULTIPLE"
+  required  Boolean  @default(false)
+  minSelection Int    @default(0)
+  maxSelection Int    @default(1)
+
+  choices   ProductOptionChoice[]
+
+  @@map("product_options")
+}
+
+model ProductOptionChoice {
+  id              String        @id @default(dbgenerated("'chc_' || replace(gen_random_uuid()::text, '-', '')"))
+  productOptionId String
+  productOption   ProductOption @relation(fields: [productOptionId], references: [id], onDelete: Cascade)
+  name            String        // "Moyenne", "Fromage extra"
+  priceFcfa       Decimal       @default(0) @db.Decimal(12, 0)
+  isAvailable     Boolean       @default(true)
+
+  @@map("product_option_choices")
+}
+
+// ============================================================
+// MODULE: ORDERS (cœur du système)
+// ============================================================
+
+enum OrderStatus {
+  CREATED              // Créée, paiement en attente
+  PENDING_PAYMENT      // Paiement initié, en attente confirmation
+  PAYMENT_FAILED       // Échec paiement
+  ACCEPTED_BY_MERCHANT // Acceptée par marchand
+  REJECTED_BY_MERCHANT // Refusée par marchand
+  PREPARING            // En préparation
+  READY_FOR_PICKUP     // Prête pour ramassage
+  COURIER_ASSIGNED     // Coursier attribué
+  COURIER_EN_ROUTE     // Coursier en route vers marchand
+  PICKED_UP            // Récupérée par coursier
+  IN_DELIVERY          // En livraison
+  DELIVERED            // Livrée avec succès
+  CANCELLED_BY_CLIENT  // Annulée par client
+  CANCELLED_BY_MERCHANT // Annulée par marchand
+  CANCELLED_BY_SYSTEM  // Annulée par système (timeout, etc.)
+  REFUNDED             // Remboursée
+}
+
+enum PaymentMethod {
+  MOMO_MTN
+  MOMO_ORANGE
+  CARD                 // Carte bancaire
+  CASH                 // Cash à la livraison
+  WALLET               // Wallet Wakaman
+}
+
+enum OrderType {
+  STANDARD             // Food, courses, pharmacie
+  COURIER              // "N'importe quoi" — coursier custom
+  TRADITIONAL_MARKET   // Marché traditionnel (Phase 2)
+  INTER_CITY           // Inter-villes (Phase 2)
+}
+
+model Order {
+  id                String      @id @default(dbgenerated("'ord_' || replace(gen_random_uuid()::text, '-', '')"))
+  orderNumber       String      @unique  // WKM-2026-001234 (lisible humain)
+
+  // Acteurs
+  clientId          String
+  client            Client      @relation(fields: [clientId], references: [id])
+  merchantId        String?
+  merchant          Merchant?   @relation(fields: [merchantId], references: [id])
+  courierId         String?
+  courier           Courier?    @relation("AssignedCourier", fields: [courierId], references: [id])
+
+  // Type et statut
+  type              OrderType   @default(STANDARD)
+  status            OrderStatus @default(CREATED)
+
+  // Adresse de livraison
+  deliveryAddressId String
+  deliveryAddress   Address     @relation("DeliveryAddress", fields: [deliveryAddressId], references: [id])
+  pickupLatitude    Decimal?    @db.Decimal(10, 7)
+  pickupLongitude   Decimal?    @db.Decimal(10, 7)
+
+  // Montants (tout en FCFA)
+  subtotalFcfa      Decimal     @db.Decimal(12, 0)
+  deliveryFeeFcfa   Decimal     @db.Decimal(12, 0)
+  serviceFeeFcfa    Decimal     @default(0) @db.Decimal(12, 0)
+  discountFcfa      Decimal     @default(0) @db.Decimal(12, 0)
+  totalFcfa         Decimal     @db.Decimal(12, 0)
+
+  // Calculs business
+  merchantPayoutFcfa Decimal?   @db.Decimal(12, 0)  // Ce qu'on doit au marchand
+  courierPayoutFcfa  Decimal?   @db.Decimal(12, 0)  // Ce qu'on doit au coursier
+  platformRevenueFcfa Decimal?  @db.Decimal(12, 0)  // Notre marge
+
+  // Paiement
+  paymentMethod     PaymentMethod
+  paymentStatus     String      @default("PENDING")  // "PENDING" | "PAID" | "FAILED" | "REFUNDED"
+  paymentId         String?     // ID du paiement chez le provider
+
+  // Distance et ETA
+  distanceMeters    Int?
+  estimatedDurationMinutes Int?
+
+  // Timestamps des événements clés
+  acceptedByMerchantAt DateTime?
+  readyForPickupAt     DateTime?
+  courierAssignedAt    DateTime?
+  pickedUpAt           DateTime?
+  deliveredAt          DateTime?
+  cancelledAt          DateTime?
+  cancellationReason   String?
+
+  // Code OTP livraison (4 chiffres)
+  deliveryOtp       String?     // Hashé
+
+  // Instructions spéciales
+  clientNotes       String?     // Note du client
+  merchantNotes     String?     // Note du marchand
+
+  // Relations
+  items             OrderItem[]
+  payments          Payment[]
+  statusHistory     OrderStatusHistory[]
+  reviews           Review[]
+
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  @@index([clientId, createdAt])
+  @@index([merchantId, status])
+  @@index([courierId, status])
+  @@index([status, createdAt])
+  @@index([orderNumber])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String   @id @default(dbgenerated("'oit_' || replace(gen_random_uuid()::text, '-', '')"))
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   String?
+  product     Product? @relation(fields: [productId], references: [id])
+
+  productName String   // Snapshot du nom au moment de la commande
+  unitPriceFcfa Decimal @db.Decimal(12, 0)
+  quantity    Int
+  totalFcfa   Decimal  @db.Decimal(12, 0)
+
+  optionsJson Json?    // Snapshot des options choisies
+  notes       String?  // Notes spéciales par item
+
+  createdAt   DateTime @default(now())
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+// Historique des changements de statut (audit)
+model OrderStatusHistory {
+  id        String      @id @default(dbgenerated("'osh_' || replace(gen_random_uuid()::text, '-', '')"))
+  orderId   String
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus OrderStatus?
+  toStatus  OrderStatus
+  changedBy String?     // userId ou "SYSTEM"
+  reason    String?
+  metadata  Json?
+
+  createdAt DateTime    @default(now())
+
+  @@index([orderId, createdAt])
+  @@map("order_status_history")
+}
+
+// ============================================================
+// MODULE: PAYMENTS
+// ============================================================
+
+enum PaymentStatus {
+  INITIATED
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum PaymentProvider {
+  MTN_MOMO
+  ORANGE_MONEY
+  FLUTTERWAVE
+  CINETPAY
+  CASH
+  WALLET
+}
+
+model Payment {
+  id                String          @id @default(dbgenerated("'pmt_' || replace(gen_random_uuid()::text, '-', '')"))
+  orderId           String
+  order             Order           @relation(fields: [orderId], references: [id])
+
+  amountFcfa        Decimal         @db.Decimal(12, 0)
+  provider          PaymentProvider
+  status            PaymentStatus   @default(INITIATED)
+
+  // Référence externe chez le provider
+  externalRef       String?         @unique
+  providerTransactionId String?
+
+  // Info phone pour MoMo/OM
+  phoneNumber       String?
+
+  // Réponse provider (pour debug)
+  providerRequestJson  Json?
+  providerResponseJson Json?
+  errorCode         String?
+  errorMessage      String?
+
+  // Timestamps
+  initiatedAt       DateTime        @default(now())
+  completedAt       DateTime?
+  failedAt          DateTime?
+  refundedAt        DateTime?
+
+  refunds           Refund[]
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([orderId])
+  @@index([status])
+  @@index([provider, externalRef])
+  @@map("payments")
+}
+
+model Refund {
+  id          String        @id @default(dbgenerated("'ref_' || replace(gen_random_uuid()::text, '-', '')"))
+  paymentId   String
+  payment     Payment       @relation(fields: [paymentId], references: [id])
+  amountFcfa  Decimal       @db.Decimal(12, 0)
+  reason      String
+  status      PaymentStatus @default(INITIATED)
+  externalRef String?
+  initiatedBy String        // userId
+
+  createdAt   DateTime      @default(now())
+  completedAt DateTime?
+
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+// ============================================================
+// MODULE: WALLET (porte-monnaie utilisateur)
+// ============================================================
+
+model Wallet {
+  id          String   @id @default(dbgenerated("'wlt_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId      String   @unique
+  balanceFcfa Decimal  @default(0) @db.Decimal(12, 0)
+
+  transactions WalletTransaction[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("wallets")
+}
+
+enum WalletTransactionType {
+  TOPUP            // Recharge
+  WITHDRAWAL       // Retrait
+  ORDER_PAYMENT    // Paiement commande
+  REFUND           // Remboursement
+  CASHBACK         // Cashback fidélité
+  REFERRAL_BONUS   // Bonus parrainage
+  ADJUSTMENT       // Ajustement admin
+}
+
+model WalletTransaction {
+  id          String                @id @default(dbgenerated("'wtx_' || replace(gen_random_uuid()::text, '-', '')"))
+  walletId    String
+  wallet      Wallet                @relation(fields: [walletId], references: [id])
+  clientId    String?
+  client      Client?               @relation(fields: [clientId], references: [id])
+
+  type        WalletTransactionType
+  amountFcfa  Decimal               @db.Decimal(12, 0)  // Positif ou négatif
+  balanceBefore Decimal             @db.Decimal(12, 0)
+  balanceAfter Decimal              @db.Decimal(12, 0)
+
+  description String
+  relatedOrderId String?
+  metadata    Json?
+
+  createdAt   DateTime              @default(now())
+
+  @@index([walletId, createdAt])
+  @@map("wallet_transactions")
+}
+
+// ============================================================
+// MODULE: PAYOUTS (reversements coursiers & marchands)
+// ============================================================
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model CourierPayout {
+  id          String       @id @default(dbgenerated("'cpo_' || replace(gen_random_uuid()::text, '-', '')"))
+  courierId   String
+  courier     Courier      @relation(fields: [courierId], references: [id])
+
+  amountFcfa  Decimal      @db.Decimal(12, 0)
+  ordersCount Int          // Nombre de courses incluses
+  periodStart DateTime
+  periodEnd   DateTime
+
+  // Mode de paiement (généralement MoMo coursier)
+  momoNumber  String
+  momoOperator String
+
+  status      PayoutStatus @default(PENDING)
+  externalRef String?
+  errorMessage String?
+
+  initiatedAt DateTime?
+  completedAt DateTime?
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([courierId, periodStart])
+  @@index([status])
+  @@map("courier_payouts")
+}
+
+model MerchantPayout {
+  id          String       @id @default(dbgenerated("'mpo_' || replace(gen_random_uuid()::text, '-', '')"))
+  merchantId  String
+  merchant    Merchant     @relation(fields: [merchantId], references: [id])
+
+  amountFcfa  Decimal      @db.Decimal(12, 0)
+  ordersCount Int
+  periodStart DateTime
+  periodEnd   DateTime
+
+  // Détails financiers
+  grossAmountFcfa Decimal  @db.Decimal(12, 0)  // CA brut
+  commissionFcfa  Decimal  @db.Decimal(12, 0)  // Commission Wakaman
+  netAmountFcfa   Decimal  @db.Decimal(12, 0)  // Net reversé
+
+  momoNumber  String
+  momoOperator String
+
+  status      PayoutStatus @default(PENDING)
+  externalRef String?
+  errorMessage String?
+
+  initiatedAt DateTime?
+  completedAt DateTime?
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([merchantId, periodStart])
+  @@index([status])
+  @@map("merchant_payouts")
+}
+
+// ============================================================
+// MODULE: REVIEWS (évaluations)
+// ============================================================
+
+enum ReviewTargetType {
+  COURIER
+  MERCHANT
+  ORDER
+}
+
+model Review {
+  id          String           @id @default(dbgenerated("'rvw_' || replace(gen_random_uuid()::text, '-', '')"))
+  orderId     String
+  order       Order            @relation(fields: [orderId], references: [id])
+  clientId    String
+  client      Client           @relation(fields: [clientId], references: [id])
+
+  targetType  ReviewTargetType
+  courierId   String?
+  courier     Courier?         @relation(fields: [courierId], references: [id])
+  merchantId  String?
+  merchant    Merchant?        @relation(fields: [merchantId], references: [id])
+
+  rating      Int              // 1 à 5
+  comment     String?
+
+  // Tags rapides
+  tags        String[]         // ["fast", "polite", "cold_food", etc.]
+
+  // Modération
+  isPublished Boolean          @default(true)
+  isFlagged   Boolean          @default(false)
+  flagReason  String?
+
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([orderId, targetType])
+  @@index([courierId])
+  @@index([merchantId])
+  @@map("reviews")
+}
+
+// ============================================================
+// MODULE: NOTIFICATIONS
+// ============================================================
+
+enum NotificationChannel {
+  PUSH
+  SMS
+  EMAIL
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+model Notification {
+  id        String              @id @default(dbgenerated("'ntf_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  channel   NotificationChannel
+  status    NotificationStatus  @default(PENDING)
+
+  title     String
+  body      String
+  data      Json?               // Payload custom (orderId, etc.)
+
+  // Tracking
+  sentAt    DateTime?
+  deliveredAt DateTime?
+  readAt    DateTime?
+  failedAt  DateTime?
+  errorMessage String?
+
+  // Provider info
+  externalRef String?           // Message ID FCM / Twilio
+
+  createdAt DateTime            @default(now())
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("notifications")
+}
+
+// ============================================================
+// MODULE: SUPPORT (tickets clients)
+// ============================================================
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_USER
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model SupportTicket {
+  id          String         @id @default(dbgenerated("'tkt_' || replace(gen_random_uuid()::text, '-', '')"))
+  ticketNumber String        @unique  // WKM-T-2026-001234
+
+  userId      String
+  orderId     String?
+
+  subject     String
+  category    String         // "DELIVERY_ISSUE" | "PAYMENT_ISSUE" | "OTHER"
+  status      TicketStatus   @default(OPEN)
+  priority    TicketPriority @default(MEDIUM)
+
+  assignedToUserId String?
+
+  messages    SupportMessage[]
+
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  resolvedAt  DateTime?
+
+  @@index([userId])
+  @@index([status, priority])
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id        String        @id @default(dbgenerated("'tms_' || replace(gen_random_uuid()::text, '-', '')"))
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  fromUserId String
+  message   String
+  attachmentUrl String?
+  isInternal Boolean      @default(false)  // Note interne agent
+
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+  @@map("support_messages")
+}
+
+// ============================================================
+// MODULE: PROMOTIONS & REFERRALS
+// ============================================================
+
+enum PromoCodeType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  FREE_DELIVERY
+}
+
+model PromoCode {
+  id          String        @id @default(dbgenerated("'pmc_' || replace(gen_random_uuid()::text, '-', '')"))
+  code        String        @unique  // "WAKAMAN20", "BIENVENUE"
+  type        PromoCodeType
+  value       Decimal       @db.Decimal(12, 2)  // % ou montant FCFA
+
+  description String?
+  minOrderFcfa Decimal      @default(0) @db.Decimal(12, 0)
+  maxDiscountFcfa Decimal?  @db.Decimal(12, 0)
+
+  // Limites
+  totalUsageLimit Int?      // Limite globale
+  perUserLimit    Int       @default(1)
+  totalUsageCount Int       @default(0)
+
+  // Validité
+  startsAt    DateTime
+  expiresAt   DateTime
+  isActive    Boolean       @default(true)
+
+  // Restrictions
+  applicableUserTypes UserType[]
+  applicableCities    String[]
+
+  usages      PromoCodeUsage[]
+
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([code, isActive])
+  @@map("promo_codes")
+}
+
+model PromoCodeUsage {
+  id          String    @id @default(dbgenerated("'pmu_' || replace(gen_random_uuid()::text, '-', '')"))
+  promoCodeId String
+  promoCode   PromoCode @relation(fields: [promoCodeId], references: [id])
+  userId      String
+  orderId     String?
+  discountAppliedFcfa Decimal @db.Decimal(12, 0)
+
+  createdAt   DateTime  @default(now())
+
+  @@unique([promoCodeId, orderId])
+  @@index([userId])
+  @@map("promo_code_usages")
+}
+
+model Referral {
+  id           String   @id @default(dbgenerated("'rfr_' || replace(gen_random_uuid()::text, '-', '')"))
+  referrerUserId String
+  refereeUserId String   @unique
+  code         String   @unique
+  bonusFcfa    Decimal  @default(1500) @db.Decimal(12, 0)
+  status       String   @default("PENDING")  // "PENDING" | "CONVERTED" | "PAID"
+  convertedAt  DateTime?  // Quand le referee a fait sa 1re commande
+  paidAt       DateTime?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([referrerUserId])
+  @@map("referrals")
+}
+
+// ============================================================
+// MODULE: AUDIT LOGS (traçabilité)
+// ============================================================
+
+model AuditLog {
+  id          String   @id @default(dbgenerated("'log_' || replace(gen_random_uuid()::text, '-', '')"))
+  userId      String?
+  action      String   // "USER_LOGIN" | "ORDER_CANCELLED" | "PAYMENT_REFUNDED" | etc.
+  entityType  String?  // "Order", "User", "Payment"
+  entityId    String?
+  oldValues   Json?
+  newValues   Json?
+  ipAddress   String?
+  userAgent   String?
+  metadata    Json?
+
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
