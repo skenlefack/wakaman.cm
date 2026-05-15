@@ -106,4 +106,14 @@ export class AuthRepository {
       },
     });
   }
+
+  async updateLastLogin(userId: string, ipAddress?: string): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        lastLoginAt: new Date(),
+        lastLoginIp: ipAddress,
+      },
+    });
+  }
 }

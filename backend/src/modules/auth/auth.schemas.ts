@@ -1,8 +1,8 @@
 /**
  * Auth module — Schemas (TypeBox)
  *
- * Contrats d'API pour signup et OTP verification.
- * verify-otp returns JWT tokens (auto-login after signup).
+ * Contrats d'API pour signup, login et OTP verification.
+ * verify-otp and verify-login-otp both return JWT tokens.
  */
 
 import { Type, Static } from '@sinclair/typebox';
@@ -43,27 +43,67 @@ export const VerifyOtpBody = Type.Object({
   type: SignupUserType,
 });
 
+export const LoginBody = Type.Object({
+  phone: Type.String({
+    pattern: '^\\+237[0-9]{9}$',
+    description: 'Phone number in E.164 format (+237XXXXXXXXX)',
+  }),
+});
+
+export const VerifyLoginOtpBody = Type.Object({
+  phone: Type.String({
+    pattern: '^\\+237[0-9]{9}$',
+    description: 'Phone number in E.164 format (+237XXXXXXXXX)',
+  }),
+  code: Type.String({
+    minLength: 6,
+    maxLength: 6,
+    pattern: '^[0-9]{6}$',
+    description: 'OTP code (6 digits)',
+  }),
+});
+
 // ============================================================
 // RESPONSES
 // ============================================================
 
-export const SignupResponse = Type.Object({
+export const UserType = Type.Union([
+  Type.Literal('CLIENT'),
+  Type.Literal('COURIER'),
+  Type.Literal('MERCHANT'),
+  Type.Literal('ADMIN'),
+  Type.Literal('SUPPORT'),
+]);
+
+const AuthUserResponse = Type.Object({
+  id: Type.String(),
+  phone: Type.String(),
+  type: UserType,
+  status: Type.String(),
+  firstName: Type.Optional(Type.String()),
+  lastName: Type.Optional(Type.String()),
+  phoneVerifiedAt: Type.String({ format: 'date-time' }),
+  createdAt: Type.String({ format: 'date-time' }),
+});
+
+export const OtpSentResponse = Type.Object({
   message: Type.String(),
   expiresInSeconds: Type.Integer(),
 });
 
-export const VerifyOtpResponse = Type.Object({
-  user: Type.Object({
-    id: Type.String(),
-    phone: Type.String(),
-    type: SignupUserType,
-    status: Type.String(),
-    phoneVerifiedAt: Type.String({ format: 'date-time' }),
-    createdAt: Type.String({ format: 'date-time' }),
-  }),
+export const SignupResponse = OtpSentResponse;
+
+export const LoginResponse = OtpSentResponse;
+
+export const AuthTokensResponse = Type.Object({
+  user: AuthUserResponse,
   accessToken: Type.String({ description: 'JWT access token (15min)' }),
   refreshToken: Type.String({ description: 'Refresh token (7 days)' }),
 });
+
+export const VerifyOtpResponse = AuthTokensResponse;
+
+export const VerifyLoginOtpResponse = AuthTokensResponse;
 
 export const ErrorResponse = Type.Object({
   error: Type.String(),
@@ -78,5 +118,6 @@ export const ErrorResponse = Type.Object({
 
 export type SignupBodyType = Static<typeof SignupBody>;
 export type VerifyOtpBodyType = Static<typeof VerifyOtpBody>;
-export type SignupResponseType = Static<typeof SignupResponse>;
-export type VerifyOtpResponseType = Static<typeof VerifyOtpResponse>;
+export type LoginBodyType = Static<typeof LoginBody>;
+export type VerifyLoginOtpBodyType = Static<typeof VerifyLoginOtpBody>;
+export type AuthTokensResponseType = Static<typeof AuthTokensResponse>;

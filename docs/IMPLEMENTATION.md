@@ -5,7 +5,7 @@
 | Module | Statut | Dernière mise à jour | Notes |
 |--------|--------|----------------------|-------|
 | Users | Partiel — routes/schemas uniquement | 2026-05-16 | Handlers, service, repository à implémenter |
-| Auth | Partiel — signup OTP (feature 1/3) | 2026-05-16 | Login/refresh (feature 2), logout/sessions (feature 3) restants |
+| Auth | Partiel — signup + login OTP (features 1-2/3) | 2026-05-16 | Refresh/logout/sessions (feature 3) restant |
 | Clients | Non commencé | — | Profil client, adresses, favoris |
 | Couriers | Non commencé | — | Onboarding, KYC, position temps réel |
 | Merchants | Non commencé | — | Onboarding, catalogue, horaires |
@@ -55,9 +55,9 @@
 |---------|-------|------|-------------|--------|
 | POST | `/api/v1/auth/signup` | Non | Envoie un OTP 6 chiffres par SMS | Implémenté |
 | POST | `/api/v1/auth/verify-otp` | Non | Vérifie l'OTP, crée le compte, retourne JWT tokens (auto-login) | Implémenté |
-| POST | `/api/v1/auth/login` | Non | Connexion par OTP (envoie un code) | TODO feature 2 |
-| POST | `/api/v1/auth/verify-login` | Non | Vérifie OTP login et retourne JWT tokens (réutilise TokenService) | TODO feature 2 |
-| POST | `/api/v1/auth/refresh` | Refresh token | Renouvelle l'access token (réutilise TokenService) | TODO feature 2 |
+| POST | `/api/v1/auth/login` | Non | Connexion par OTP (envoie un code). Rejette numéros non inscrits, suspendus, bannis | Implémenté |
+| POST | `/api/v1/auth/verify-login-otp` | Non | Vérifie OTP login, crée Session, retourne `{ user, accessToken, refreshToken }` | Implémenté |
+| POST | `/api/v1/auth/refresh` | Refresh token | Renouvelle l'access token (réutilise TokenService) | TODO feature 3 |
 | POST | `/api/v1/auth/logout` | JWT | Révoque la session | TODO feature 3 |
 
 - **Modèles de données utilisés** : `User`, `Session`, `OTPCode`
@@ -71,6 +71,10 @@
   7. **jwtSign injecté via DI (pas de couplage Fastify)** : `fastify.jwt.sign` est enregistré dans le container Awilix depuis `server.ts` après chargement du plugin `@fastify/jwt`. TokenService reçoit une fonction `JwtSign` typée, pas l'instance Fastify. Alternative rejetée : utiliser `jsonwebtoken` ou `fast-jwt` directement (ajoute une dépendance et diverge du plugin déjà configuré).
   8. **Refresh token hashé en DB (SHA-256)** : le refresh token est stocké hashé dans la table `sessions`, pas en clair. Si la DB est compromise, les tokens ne sont pas exploitables. Le token en clair n'est retourné qu'une fois au client.
   9. **Gestion du signup abandonné et des race conditions** : verify-otp gère 3 cas après OTP valide — (a) user déjà vérifié → 409 Conflict, (b) user existant mais non vérifié (signup abandonné) → `activateUser` passe le compte en ACTIVE au lieu de re-créer, (c) nouveau user → `createUser` avec catch Prisma P2002 pour les race conditions. Aucun chemin ne produit de 500 sur contrainte unique phone. Alternative rejetée : upsert Prisma (moins explicite, masque les cas métier distincts).
+  10. **Message d'erreur générique pour login (anti-énumération)** : quand le numéro n'existe pas OU n'est pas vérifié, l'erreur retournée est `401 "Invalid credentials"` — identique dans les deux cas. Empêche un attaquant de deviner quels numéros sont inscrits. Alternative rejetée : message spécifique « numéro non inscrit » (fuite d'information).
+  11. **Double vérification du statut SUSPENDED/BANNED** : vérifié à la fois dans `login()` (avant envoi OTP, pour ne pas gaspiller un SMS) et dans `verifyLoginOtp()` (après OTP valide, car le statut peut changer entre les deux appels). Alternative rejetée : vérifier uniquement dans login (race condition si l'admin suspend entre l'envoi OTP et la vérification).
+  12. **OTP purpose séparé LOGIN vs SIGNUP** : les OTP login utilisent `purpose: 'LOGIN'`, distincts de `'SIGNUP'`. `invalidatePendingOtps` ne cible que le purpose courant — un OTP signup en cours n'est pas invalidé par une tentative login et vice-versa.
+  13. **`updateLastLogin` au verify, pas au login** : `lastLoginAt` et `lastLoginIp` sont mis à jour uniquement quand le login réussit (OTP vérifié), pas quand le code est demandé. Reflète la réalité de la connexion.
 - **Dépendances vers d'autres modules** : Aucune (crée les Users directement via son propre repository)
 - **Points de vigilance / dette technique connue** :
   - Le rate limit auth (5/min/IP) est déclaré au niveau route via `config.rateLimit` — nécessite que `@fastify/rate-limit` supporte le override par route (vérifié OK avec Fastify 5)
@@ -90,11 +94,23 @@
     -d '{"phone": "+237691234567", "code": "123456", "type": "CLIENT"}'
   # → {"user":{...},"accessToken":"eyJ...","refreshToken":"a1b2c3..."}
 
-  # 3. Utiliser l'access token pour les requêtes authentifiées
+  # 3. Login (numéro déjà inscrit)
+  curl -X POST http://localhost:3000/api/v1/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"phone": "+237691234567"}'
+  # → {"message":"Verification code sent","expiresInSeconds":300}
+
+  # 4. Vérifier l'OTP login — retourne user + tokens
+  curl -X POST http://localhost:3000/api/v1/auth/verify-login-otp \
+    -H "Content-Type: application/json" \
+    -d '{"phone": "+237691234567", "code": "654321"}'
+  # → {"user":{...},"accessToken":"eyJ...","refreshToken":"a1b2c3..."}
+
+  # 5. Utiliser l'access token pour les requêtes authentifiées
   curl http://localhost:3000/api/v1/users/me \
     -H "Authorization: Bearer <accessToken>"
   ```
-- **Statut des tests automatisés** : Aucun test écrit (prévu après validation de la structure)
+- **Statut des tests automatisés** : 14 tests unitaires (login + verify-login-otp) couvrant : succès, phone inexistant, phone non vérifié, compte SUSPENDED, compte BANNED, OTP expiré, OTP déjà utilisé, max tentatives, code invalide, tentatives restantes, user supprimé entre login et verify, device info
 
 ---
 

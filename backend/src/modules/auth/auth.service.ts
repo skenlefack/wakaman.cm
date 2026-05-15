@@ -1,20 +1,21 @@
 /**
  * Auth module — Service (business logic)
  *
- * Handles OTP generation, verification, user creation, and auto-login during signup.
- * Login/refresh will be added in feature 2 (reusing TokenService).
+ * Handles OTP generation, verification, user creation (signup),
+ * and login via OTP with auto-login (token generation).
+ * Refresh/logout will be added in feature 3.
  */
 
 import { createHash, randomInt } from 'node:crypto';
 import type { Logger } from 'pino';
 import { Prisma } from '@prisma/client';
-import { ConflictError, OtpError } from '../../lib/errors.js';
+import { ConflictError, ForbiddenError, OtpError, UnauthorizedError } from '../../lib/errors.js';
 import type { AuthRepository } from './auth.repository.js';
 import type { TokenService } from './token.service.js';
 import type { DeviceInfo } from './token.service.js';
 import type { SmsProvider } from '../../providers/sms/sms.provider.js';
 import { OTP_LENGTH, OTP_EXPIRY_MINUTES, OTP_MAX_ATTEMPTS } from './auth.types.js';
-import type { SignupBodyType, VerifyOtpBodyType } from './auth.schemas.js';
+import type { SignupBodyType, VerifyOtpBodyType, LoginBodyType, VerifyLoginOtpBodyType } from './auth.schemas.js';
 
 export class AuthService {
   constructor(
@@ -136,6 +137,118 @@ export class AuthService {
         type: user.type,
         status: user.status,
         phoneVerifiedAt: user.phoneVerifiedAt!.toISOString(),
+        createdAt: user.createdAt.toISOString(),
+      },
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+    };
+  }
+
+  // ============================================================
+  // LOGIN — Step 1: Send OTP to existing user
+  // ============================================================
+
+  async login(data: LoginBodyType): Promise<{ message: string; expiresInSeconds: number }> {
+    const user = await this.authRepository.findUserByPhone(data.phone);
+
+    // Generic error to prevent account enumeration
+    if (!user || !user.phoneVerifiedAt) {
+      throw new UnauthorizedError('Invalid credentials');
+    }
+
+    if (user.status === 'SUSPENDED' || user.status === 'BANNED') {
+      throw new ForbiddenError('Account suspended');
+    }
+
+    await this.authRepository.invalidatePendingOtps(data.phone, 'LOGIN');
+
+    const otp = this.generateOtp();
+
+    await this.authRepository.createOtp({
+      phone: data.phone,
+      code: otp.hash,
+      purpose: 'LOGIN',
+      expiresAt: otp.expiresAt,
+    });
+
+    const smsResult = await this.smsProvider.send({
+      to: data.phone,
+      message: `Wakaman: votre code de connexion est ${otp.code}. Valable ${OTP_EXPIRY_MINUTES} minutes.`,
+    });
+
+    if (!smsResult.success) {
+      this.logger.error({ phone: data.phone, error: smsResult.error }, 'Failed to send login OTP SMS');
+      throw new OtpError('Failed to send verification code. Please try again.');
+    }
+
+    return {
+      message: 'Verification code sent',
+      expiresInSeconds: OTP_EXPIRY_MINUTES * 60,
+    };
+  }
+
+  // ============================================================
+  // LOGIN — Step 2: Verify OTP & create session
+  // ============================================================
+
+  async verifyLoginOtp(data: VerifyLoginOtpBodyType, deviceInfo?: DeviceInfo) {
+    const otpRecord = await this.authRepository.findLatestOtp(data.phone, 'LOGIN');
+
+    if (!otpRecord) {
+      throw new OtpError('No pending verification code found. Please request a new one.');
+    }
+
+    if (otpRecord.verified) {
+      throw new OtpError('This code has already been used.');
+    }
+
+    if (otpRecord.expiresAt < new Date()) {
+      throw new OtpError('Verification code has expired. Please request a new one.');
+    }
+
+    if (otpRecord.attempts >= OTP_MAX_ATTEMPTS) {
+      throw new OtpError('Too many failed attempts. Please request a new code.', otpRecord.attempts);
+    }
+
+    const codeHash = this.hashCode(data.code);
+
+    if (codeHash !== otpRecord.code) {
+      await this.authRepository.incrementOtpAttempts(otpRecord.id);
+      const remaining = OTP_MAX_ATTEMPTS - otpRecord.attempts - 1;
+      throw new OtpError(
+        `Invalid verification code. ${remaining} attempt(s) remaining.`,
+        otpRecord.attempts + 1,
+      );
+    }
+
+    await this.authRepository.markOtpVerified(otpRecord.id);
+
+    const user = await this.authRepository.findUserByPhone(data.phone);
+
+    // Re-check: user must still exist, be verified, and not suspended/banned
+    if (!user || !user.phoneVerifiedAt) {
+      throw new UnauthorizedError('Invalid credentials');
+    }
+
+    if (user.status === 'SUSPENDED' || user.status === 'BANNED') {
+      throw new ForbiddenError('Account suspended');
+    }
+
+    await this.authRepository.updateLastLogin(user.id, deviceInfo?.ipAddress);
+
+    const tokens = await this.tokenService.generateTokenPair(user.id, user.type, deviceInfo);
+
+    this.logger.info({ userId: user.id, phone: data.phone }, 'User logged in via OTP');
+
+    return {
+      user: {
+        id: user.id,
+        phone: user.phone,
+        type: user.type,
+        status: user.status,
+        firstName: user.firstName ?? undefined,
+        lastName: user.lastName ?? undefined,
+        phoneVerifiedAt: user.phoneVerifiedAt.toISOString(),
         createdAt: user.createdAt.toISOString(),
       },
       accessToken: tokens.accessToken,
