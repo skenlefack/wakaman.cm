@@ -9,6 +9,7 @@ import autoload from '@fastify/autoload';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
+import { asValue } from 'awilix';
 import { container } from './container.js';
 import { AppError } from './lib/errors.js';
 import { registerSwagger } from './plugins/swagger.js';
@@ -112,6 +113,11 @@ export async function build(): Promise<FastifyInstance> {
   await fastify.register(import('@fastify/jwt'), {
     secret: process.env.JWT_SECRET!,
     sign: { expiresIn: process.env.JWT_ACCESS_EXPIRES ?? '15m' },
+  });
+
+  // Expose jwt.sign to DI container so TokenService can generate tokens
+  container.register({
+    jwtSign: asValue(fastify.jwt.sign.bind(fastify.jwt)),
   });
 
   await fastify.register(import('@fastify/under-pressure'), {

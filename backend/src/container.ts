@@ -15,6 +15,14 @@ import { PrismaClient } from '@prisma/client';
 import Redis from 'ioredis';
 import pino from 'pino';
 
+import { AuthRepository } from './modules/auth/auth.repository.js';
+import { AuthService } from './modules/auth/auth.service.js';
+import { TokenService } from './modules/auth/token.service.js';
+import type { JwtSign } from './modules/auth/token.service.js';
+import { TwilioProvider } from './providers/sms/twilio.provider.js';
+import { FakeSmsProvider } from './providers/sms/fake-sms.provider.js';
+import type { SmsProvider } from './providers/sms/sms.provider.js';
+
 // ============================================================
 // CRÉATION DES INSTANCES SINGLETON
 // ============================================================
@@ -43,16 +51,17 @@ export interface AppContainer {
   redis: Redis;
   logger: pino.Logger;
 
-  // Services à enregistrer ici au fur et à mesure :
+  // Auth module
+  jwtSign: JwtSign;
+  smsProvider: SmsProvider;
+  authRepository: AuthRepository;
+  tokenService: TokenService;
+  authService: AuthService;
+
+  // TODO: register as modules are implemented
   // usersService: UsersService;
   // usersRepository: UsersRepository;
   // ordersService: OrdersService;
-  // ordersRepository: OrdersRepository;
-  // paymentsService: PaymentsService;
-  // mtnMomoProvider: MtnMomoProvider;
-  // orangeMoneyProvider: OrangeMoneyProvider;
-  // matchingService: MatchingService;
-  // notificationsService: NotificationsService;
   // ...
 }
 
@@ -60,16 +69,25 @@ export const container: AwilixContainer<AppContainer> = createContainer<AppConta
   injectionMode: 'CLASSIC', // Injection par nom de paramètre
 });
 
+// Select SMS provider based on environment
+const smsProvider: SmsProvider = process.env.NODE_ENV === 'production'
+  ? new TwilioProvider(logger)
+  : new FakeSmsProvider(logger);
+
 container.register({
   // Infrastructure (singletons)
   prisma: asValue(prisma),
   redis: asValue(redis),
   logger: asValue(logger),
 
-  // Services : à ajouter au fur et à mesure que tu crées les modules
-  // Exemple :
-  // usersService: asClass(UsersService).scoped(),
-  // usersRepository: asClass(UsersRepository).scoped(),
+  // Providers (singletons)
+  smsProvider: asValue(smsProvider),
+
+  // Auth module (scoped per request)
+  // NOTE: jwtSign is registered later in server.ts after @fastify/jwt plugin loads
+  authRepository: asClass(AuthRepository).scoped(),
+  tokenService: asClass(TokenService).scoped(),
+  authService: asClass(AuthService).scoped(),
 });
 
 // ============================================================
