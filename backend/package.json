@@ -19,7 +19,9 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "seed": "tsx prisma/seed.ts"
+    "postinstall": "prisma generate",
+    "seed": "tsx prisma/seed.ts",
+    "reindex": "tsx src/scripts/reindex.ts"
   },
   "dependencies": {
     "fastify": "^5.0.0",
@@ -45,6 +47,7 @@
     "bcryptjs": "^2.4.3",
     "nanoid": "^5.0.0",
     "date-fns": "^3.6.0",
+    "meilisearch": "^0.41.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {

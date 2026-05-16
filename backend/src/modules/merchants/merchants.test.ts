@@ -92,17 +92,27 @@ function createMockAuthRepo() {
 type MockMerchRepo = ReturnType<typeof createMockMerchantsRepo>;
 type MockAuthRepo = ReturnType<typeof createMockAuthRepo>;
 
+function createMockSearchIndexService() {
+  return {
+    indexProduct: vi.fn().mockResolvedValue(undefined),
+    removeProduct: vi.fn().mockResolvedValue(undefined),
+    reindexMerchantProducts: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function createService() {
   const merchRepo = createMockMerchantsRepo();
   const authRepo = createMockAuthRepo();
+  const searchIdx = createMockSearchIndexService();
   const redis = createMockRedis();
   const service = new MerchantsService(
     merchRepo as unknown as MerchantsRepository,
     authRepo as unknown as AuthRepository,
+    searchIdx as any,
     redis as unknown as Redis,
     createMockLogger(),
   );
-  return { service, merchRepo, authRepo, redis };
+  return { service, merchRepo, authRepo, searchIdx, redis };
 }
 
 // ============================================================
@@ -279,6 +289,15 @@ describe('MerchantsService.approve', () => {
 
     await expect(service.approve('mch_abc123')).rejects.toThrow('must be PENDING');
   });
+
+  it('should reindex merchant products on approve', async () => {
+    const { service, merchRepo, searchIdx } = createService();
+    merchRepo.findById.mockResolvedValue(createMockMerchant({ status: 'PENDING' }));
+    merchRepo.updateStatus.mockResolvedValue(createMockMerchant({ status: 'ACTIVE' }));
+
+    await service.approve('mch_abc123');
+    expect(searchIdx.reindexMerchantProducts).toHaveBeenCalledWith('mch_abc123');
+  });
 });
 
 describe('MerchantsService.suspend', () => {
@@ -290,6 +309,15 @@ describe('MerchantsService.suspend', () => {
     const result = await service.suspend('mch_abc123');
     expect(result.status).toBe('SUSPENDED');
     expect(redis.del).toHaveBeenCalledWith('merchant:mch_abc123');
+  });
+
+  it('should reindex merchant products on suspend', async () => {
+    const { service, merchRepo, searchIdx } = createService();
+    merchRepo.findById.mockResolvedValue(createMockMerchant());
+    merchRepo.updateStatus.mockResolvedValue(createMockMerchant({ status: 'SUSPENDED' }));
+
+    await service.suspend('mch_abc123');
+    expect(searchIdx.reindexMerchantProducts).toHaveBeenCalledWith('mch_abc123');
   });
 });
 

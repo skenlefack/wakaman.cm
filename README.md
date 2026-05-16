@@ -12,7 +12,7 @@ Devenir la **super-app de référence** en Afrique centrale pour la livraison de
 
 ```
 wakaman/
-├── backend/         # API NestJS + Prisma + PostgreSQL
+├── backend/         # API Fastify 5.x + Prisma + PostgreSQL
 ├── android/         # 3 apps Kotlin natives (client, courier, merchant)
 ├── ios/             # 2 apps Swift natives (client, merchant)
 ├── admin-web/       # Console admin Next.js
@@ -25,7 +25,7 @@ wakaman/
 
 | Couche | Technologie |
 |---|---|
-| Backend | NestJS 11 + TypeScript + Prisma + PostgreSQL 16 + PostGIS |
+| Backend | Fastify 5.x + TypeScript + Prisma + PostgreSQL 16 + PostGIS |
 | Android | Kotlin + Jetpack Compose + MVVM + Hilt |
 | iOS | Swift 5+ + SwiftUI + Combine + MVVM |
 | Admin | Next.js 15 + React Query + Tailwind |
@@ -46,24 +46,26 @@ wakaman/
 
 ```bash
 # Cloner le repo
-git clone https://github.com/wakaman/wakaman.git
-cd wakaman
+git clone https://github.com/skenlefack/wakaman.cm.git
+cd wakaman.cm
 
-# Installer les dépendances (workspace npm)
+# Installer les dépendances (workspace npm — postinstall runs prisma generate)
 npm install
 
-# Lancer la stack locale (Postgres, Redis, RabbitMQ)
-docker-compose up -d
+# Lancer la stack locale (Postgres, Redis, RabbitMQ, Meilisearch, Mailhog)
+docker compose up -d
 
 # Setup backend
 cd backend
 cp .env.example .env
-npx prisma migrate dev
-npm run start:dev
+npx prisma migrate dev   # Applique les migrations + crée la DB
+npm run dev              # Démarre le serveur en mode watch
 
-# Dans un autre terminal : admin web
-cd admin-web
-npm run dev
+# Lancer les tests
+npx vitest run
+
+# (Optionnel) Reconstruire l'index Meilisearch
+npm run reindex
 ```
 
 ## 📋 Roadmap

@@ -10,6 +10,7 @@ import type { Logger } from 'pino';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../../lib/errors.js';
 import type { CatalogRepository } from './catalog.repository.js';
 import type { MerchantsService } from '../merchants/merchants.service.js';
+import type { SearchIndexService } from '../search/search-index.service.js';
 import type {
   CreateCategoryBodyType, UpdateCategoryBodyType, ReorderCategoriesBodyType,
   CreateProductBodyType, UpdateProductBodyType, ToggleAvailabilityBodyType, ProductsQueryType,
@@ -25,6 +26,7 @@ export class CatalogService {
   constructor(
     private readonly catalogRepository: CatalogRepository,
     private readonly merchantsService: MerchantsService,
+    private readonly searchIndexService: SearchIndexService,
     private readonly redis: Redis,
     private readonly logger: Logger,
   ) {}
@@ -59,6 +61,10 @@ export class CatalogService {
     await this.merchantsService.verifyMembership(userId, cat.merchantId);
     const updated = await this.catalogRepository.updateCategory(categoryId, data);
     await this.invalidateCache(cat.merchantId);
+    // Reindex products in this category if name changed (categoryName in Meilisearch doc)
+    if (data.name) {
+      await this.searchIndexService.reindexMerchantProducts(cat.merchantId);
+    }
     return this.serializeCategory(updated);
   }
 
@@ -138,6 +144,7 @@ export class CatalogService {
 
     const product = await this.catalogRepository.createProduct(merchantId, data);
     await this.invalidateCache(merchantId);
+    await this.searchIndexService.indexProduct(product.id);
     return this.serializeProduct(product);
   }
 
@@ -153,6 +160,7 @@ export class CatalogService {
 
     const updated = await this.catalogRepository.updateProduct(productId, data);
     await this.invalidateCache((product as any).merchantId);
+    await this.searchIndexService.indexProduct(productId);
     return this.serializeProduct(updated);
   }
 
@@ -160,12 +168,14 @@ export class CatalogService {
     const product = await this.assertOwnedProduct(productId, userId);
     await this.catalogRepository.softDeleteProduct(productId);
     await this.invalidateCache((product as any).merchantId);
+    await this.searchIndexService.indexProduct(productId);
   }
 
   async toggleAvailability(productId: string, userId: string, data: ToggleAvailabilityBodyType) {
     const product = await this.assertOwnedProduct(productId, userId);
     const updated = await this.catalogRepository.updateProduct(productId, { isAvailable: data.isAvailable });
     await this.invalidateCache((product as any).merchantId);
+    await this.searchIndexService.indexProduct(productId);
     return this.serializeProduct(updated);
   }
 

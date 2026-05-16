@@ -11,6 +11,7 @@ import { Prisma } from '@prisma/client';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../../lib/errors.js';
 import type { MerchantsRepository } from './merchants.repository.js';
 import type { AuthRepository } from '../auth/auth.repository.js';
+import type { SearchIndexService } from '../search/search-index.service.js';
 import type {
   CreateMerchantBodyType,
   UpdateMerchantBodyType,
@@ -26,6 +27,7 @@ export class MerchantsService {
   constructor(
     private readonly merchantsRepository: MerchantsRepository,
     private readonly authRepository: AuthRepository,
+    private readonly searchIndexService: SearchIndexService,
     private readonly redis: Redis,
     private readonly logger: Logger,
   ) {}
@@ -103,6 +105,10 @@ export class MerchantsService {
 
     const updated = await this.merchantsRepository.update(merchantId, data);
     await this.invalidateCache(merchantId);
+    // Reindex products if merchantName or businessName changed (affects Meilisearch docs)
+    if (data.businessName) {
+      await this.searchIndexService.reindexMerchantProducts(merchantId);
+    }
     return this.serializePublic(updated);
   }
 
@@ -239,6 +245,7 @@ export class MerchantsService {
 
     const updated = await this.merchantsRepository.updateStatus(merchantId, 'ACTIVE');
     await this.invalidateCache(merchantId);
+    await this.searchIndexService.reindexMerchantProducts(merchantId);
     this.logger.info({ merchantId }, 'Merchant approved by admin');
     return this.serializePublic(updated);
   }
@@ -250,6 +257,7 @@ export class MerchantsService {
     // TODO: when Orders module exists, cancel all pending orders for this merchant
     const updated = await this.merchantsRepository.updateStatus(merchantId, 'SUSPENDED');
     await this.invalidateCache(merchantId);
+    await this.searchIndexService.reindexMerchantProducts(merchantId);
     this.logger.info({ merchantId }, 'Merchant suspended by admin');
     return this.serializePublic(updated);
   }

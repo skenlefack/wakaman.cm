@@ -28,6 +28,9 @@ import { MerchantsRepository } from './modules/merchants/merchants.repository.js
 import { MerchantsService } from './modules/merchants/merchants.service.js';
 import { CatalogRepository } from './modules/catalog/catalog.repository.js';
 import { CatalogService } from './modules/catalog/catalog.service.js';
+import { SearchService } from './modules/search/search.service.js';
+import { SearchIndexService } from './modules/search/search-index.service.js';
+import { MeiliSearch } from 'meilisearch';
 
 // ============================================================
 // CRÉATION DES INSTANCES SINGLETON
@@ -76,6 +79,11 @@ export interface AppContainer {
   catalogRepository: CatalogRepository;
   catalogService: CatalogService;
 
+  // Search module
+  meilisearch: MeiliSearch;
+  searchService: SearchService;
+  searchIndexService: SearchIndexService;
+
   // TODO: register as modules are implemented
   // ordersService: OrdersService;
   // ...
@@ -89,6 +97,11 @@ export const container: AwilixContainer<AppContainer> = createContainer<AppConta
 const smsProvider: SmsProvider = process.env.NODE_ENV === 'production'
   ? new TwilioProvider(logger)
   : new FakeSmsProvider(logger);
+
+const meilisearch = new MeiliSearch({
+  host: process.env.MEILISEARCH_HOST ?? 'http://localhost:7700',
+  apiKey: process.env.MEILISEARCH_API_KEY,
+});
 
 container.register({
   // Infrastructure (singletons)
@@ -116,6 +129,11 @@ container.register({
   // Catalog module (scoped per request)
   catalogRepository: asClass(CatalogRepository).scoped(),
   catalogService: asClass(CatalogService).scoped(),
+
+  // Search module
+  meilisearch: asValue(meilisearch),
+  searchService: asClass(SearchService).scoped(),
+  searchIndexService: asClass(SearchIndexService).scoped(),
 });
 
 // ============================================================

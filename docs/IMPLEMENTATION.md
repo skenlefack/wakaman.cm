@@ -1,5 +1,36 @@
 # Wakaman — Journal d'implémentation
 
+## Setup local
+
+```bash
+# 1. Installer les dépendances (postinstall déclenche prisma generate)
+npm install
+
+# 2. Lancer les services Docker
+docker compose up -d   # PostgreSQL+PostGIS, Redis, RabbitMQ, Meilisearch, Mailhog
+
+# 3. Créer la base de données et appliquer les migrations
+cd backend
+cp .env.example .env
+npx prisma migrate dev
+
+# 4. Lancer le serveur de développement
+npm run dev
+
+# 5. Lancer les tests
+npx vitest run
+
+# 6. (Optionnel) Reconstruire l'index Meilisearch depuis PostgreSQL
+npm run reindex
+```
+
+**Troubleshooting :**
+- `TypeError: Prisma.sql is not a function` → relancer `npx prisma generate` (le client Prisma n'a pas été généré après install)
+- `ECONNREFUSED` sur les tests → vérifier que `docker compose up -d` est lancé (Postgres + Redis + Meilisearch requis)
+- Meilisearch vide après premier déploiement → `npm run reindex`
+
+---
+
 ## Vue d'ensemble de l'avancement
 
 | Module | Statut | Dernière mise à jour | Notes |
@@ -9,7 +40,7 @@
 | Clients | Non commencé | — | Profil client, adresses, favoris |
 | Couriers | Non commencé | — | Onboarding, KYC, position temps réel |
 | Merchants | Partiel — feature 1/3 (CRUD, team, hours) | 2026-05-16 | Catalog (products/categories) et géo-search restants |
-| Catalog | Partiel — feature 2/3 (categories, products, options) | 2026-05-16 | Géo-search Meilisearch = feature 3 |
+| Catalog | **Complet** (3/3 features) | 2026-05-16 | Merchants CRUD, categories/products, geo-search + Meilisearch |
 | Orders | Non commencé | — | Création, state machine, assignation |
 | Payments | Non commencé | — | MTN MoMo, Orange Money, wallet |
 | Tracking | Non commencé | — | WebSocket, position coursier |
@@ -321,6 +352,47 @@
 
 ---
 
+### Search (feature 3/3 — geo + Meilisearch)
+
+- **Rôle et responsabilité** : Découverte de marchands proches (PostGIS) et recherche full-text de produits (Meilisearch).
+- **Endpoints exposés** :
+
+| Méthode | Route | Auth | Description |
+|---------|-------|------|-------------|
+| GET | `/api/v1/merchants/nearby` | Non | Marchands proches (PostGIS ST_DWithin), tri par distance, isCurrentlyOpen |
+| GET | `/api/v1/products/search` | Non | Recherche produits (Meilisearch), filtre geo optionnel |
+
+- **Modèles de données utilisés** : `Merchant` (+ colonne `location geography`), `MerchantHours`, `Product` (via Meilisearch index)
+- **Décisions d'architecture** :
+  1. **PostGIS raw SQL via $queryRaw tagged templates** : Prisma ne supporte pas natif les opérateurs PostGIS. On utilise `Prisma.sql` tagged templates avec `Prisma.empty` pour les clauses conditionnelles (type, search). Injection SQL impossible par construction. Alternative rejetée : $queryRawUnsafe avec interpolation positionnelle (moins sûr, plus fragile).
+  2. **Colonne `location` maintenue en applicatif** : le repository set location = ST_MakePoint(lng, lat) à la création/update du merchant. Pas de trigger SQL. Plus simple à tester. Migration SQL incluse pour le backfill initial.
+  3. **Index GIST sur location + trigram sur business_name** : deux index spécialisés pour les deux use cases (proximité + ILIKE search). Migration SQL fournie.
+  4. **isCurrentlyOpen calculé en mémoire** : après la requête PostGIS, on fetch les MerchantHours des résultats et on compare avec l'heure Africa/Douala (UTC+1, pas de DST). Pas d'horaires = fermé par sécurité.
+  5. **Cache geo 60s (arrondissement à 3 décimales)** : les coordonnées sont arrondies à ~111m de précision dans la clé cache. TTL court (60s), pas d'invalidation nécessaire — les marchands ne bougent pas.
+  6. **Meilisearch full document enrichi** : le document indexé contient merchantName, merchantCity, merchantType, merchantStatus, categoryName. Permet le filtrage et l'affichage sans jointure côté lecture. Coût : réindexation nécessaire quand le merchant change.
+  7. **Synchronisation Meilisearch fail-open** : si Meilisearch est down pendant une write Postgres, on log un warning et on continue. La désync sera corrigée par `npm run reindex` ou par le prochain write. Alternative rejetée : queue (RabbitMQ) pour retry — overkill pour MVP, à ajouter si désync fréquente en prod.
+  8. **Réindexation : full reindex via script + partielle par merchant** : `npm run reindex` purge et reconstruit tout. `SearchIndexService.reindexMerchantProducts()` réindexe les produits d'un seul marchand (appelé sur suspend/approve/update merchant).
+  9. **Post-filtrage geo sur search produits (best-effort pagination)** : Meilisearch ne supporte pas natif le filtrage par coordonnées PostGIS. On fait le search Meilisearch d'abord, puis on filtre les résultats par merchantId ∈ (marchands dans le rayon). Conséquence : quand geo est appliqué, le nombre de résultats retournés peut être < pageSize, et `total` est une estimation Meilisearch. Le client traite `items.length < pageSize` comme "fin de résultats". Choix explicite : best-effort documenté, pas d'oversampling (qui ne résout pas le total incohérent et ajoute de la complexité). Meilisearch native geo (v1.1+ `_geoRadius`) remplacera ce post-filtrage plus tard.
+  10. **SearchIndexService câblé dans CatalogService et MerchantsService** : chaque write product (create/update/delete/toggle) appelle `searchIndexService.indexProduct()`. Chaque changement merchant impactant l'index (approve/suspend/update businessName) appelle `reindexMerchantProducts()`. Category name update → reindex marchand entier.
+- **Dépendances vers d'autres modules** : Merchants (MerchantHours pour isOpen), Catalog (products data)
+- **Points de vigilance / dette technique connue** :
+  - **Reindex full nécessaire après migration initiale** : le `location` PostGIS n'est populé que par la migration SQL pour les marchands existants. Les nouveaux marchands doivent avoir leur `location` set dans le repository (TODO: à ajouter dans MerchantsRepository.create/update).
+  - **Post-filtrage geo** : si Meilisearch retourne 50 résultats et que 45 sont hors rayon, le client voit 5 résultats. Pagination incohérente. Acceptable MVP, à résoudre en indexant lat/lng dans Meilisearch (géo natif Meilisearch v1.1+).
+- **Comment tester manuellement** :
+  ```bash
+  # 1. Recherche marchands proches
+  curl "http://localhost:3000/api/v1/merchants/nearby?lat=4.0510&lng=9.7679&radius=5000&type=RESTAURANT"
+
+  # 2. Recherche produits
+  curl "http://localhost:3000/api/v1/products/search?q=pizza&lat=4.05&lng=9.77"
+
+  # 3. Full reindex
+  cd backend && npm run reindex
+  ```
+- **Statut des tests automatisés** : 18 tests unitaires couvrant : nearby (in radius, out of radius, SUSPENDED filtered, no hours=closed, type filter, search ILIKE, distance sort, cache), product search (mandatory filters, hits, category filter, geo post-filter), index service (index on create, update, soft delete, merchant suspended, Meilisearch down=fail-open, remove)
+
+---
+
 ### Orders
 
 - **Rôle et responsabilité** : Création de commandes, state machine (18 statuts), assignation coursier, historique.
@@ -425,3 +497,6 @@
 | User profile cache | Redis `user:{id}` TTL 5min | Pas de cache / cache HTTP | Invalidation explicite sur write; fréquent read (ouverture app) |
 | Admin auth | Simple `requireAdmin` decorator | RBAC complet | Suffisant Phase 1 (1 admin); RBAC quand rôles granulaires nécessaires |
 | Access token revocation | Redis blocklist `blocked:{userId}` TTL 15min | Check DB sur chaque requête | Sub-ms Redis vs DB round-trip; fail-open si Redis down (15min max exposure) |
+| Geo search | PostGIS ST_DWithin + GIST index + raw SQL | Calcul applicatif haversine | O(log n) index vs O(n) scan; nécessite extension PostGIS |
+| Full-text search | Meilisearch (index enrichi) | PostgreSQL full-text / Elasticsearch | Léger, typo-tolerant, < 50ms; sync fail-open |
+| Meilisearch sync | Write-through fail-open + `npm run reindex` | Queue + worker | Simple pour MVP; reindex compense les désync rares |

@@ -64,17 +64,27 @@ function mockMerchantsService() {
   };
 }
 
+function mockSearchIndexService() {
+  return {
+    indexProduct: vi.fn().mockResolvedValue(undefined),
+    removeProduct: vi.fn().mockResolvedValue(undefined),
+    reindexMerchantProducts: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
 function createService() {
   const catRepo = mockCatalogRepo();
   const merchSvc = mockMerchantsService();
+  const searchIdx = mockSearchIndexService();
   const redis = mockRedis();
   const service = new CatalogService(
     catRepo as unknown as CatalogRepository,
     merchSvc as unknown as MerchantsService,
+    searchIdx as any,
     redis as unknown as Redis,
     mockLogger(),
   );
-  return { service, catRepo, merchSvc, redis };
+  return { service, catRepo, merchSvc, searchIdx, redis };
 }
 
 const MOCK_CATEGORY = { id: 'cat_abc', merchantId: 'mch_abc', name: 'Plats', description: null, imageUrl: null, sortOrder: 0, isActive: true, createdAt: new Date(), updatedAt: new Date() };
@@ -211,6 +221,44 @@ describe('CatalogService — Products', () => {
     redis.keys.mockResolvedValue(['catalog:mch_abc:p1:s20:c']);
     await service.createProduct('mch_abc', 'usr_owner', { name: 'X', priceFcfa: 100 });
     expect(redis.keys).toHaveBeenCalled();
+  });
+
+  it('should call searchIndexService.indexProduct on create', async () => {
+    const { service, catRepo, searchIdx } = createService();
+    catRepo.createProduct.mockResolvedValue(MOCK_PRODUCT);
+    await service.createProduct('mch_abc', 'usr_owner', { name: 'X', priceFcfa: 100 });
+    expect(searchIdx.indexProduct).toHaveBeenCalledWith('prd_abc');
+  });
+
+  it('should call searchIndexService.indexProduct on update', async () => {
+    const { service, catRepo, searchIdx } = createService();
+    catRepo.findProductById.mockResolvedValue(MOCK_PRODUCT);
+    catRepo.updateProduct.mockResolvedValue(MOCK_PRODUCT);
+    await service.updateProduct('prd_abc', 'usr_owner', { name: 'Updated' });
+    expect(searchIdx.indexProduct).toHaveBeenCalledWith('prd_abc');
+  });
+
+  it('should call searchIndexService.indexProduct on soft delete', async () => {
+    const { service, catRepo, searchIdx } = createService();
+    catRepo.findProductById.mockResolvedValue(MOCK_PRODUCT);
+    await service.deleteProduct('prd_abc', 'usr_owner');
+    expect(searchIdx.indexProduct).toHaveBeenCalledWith('prd_abc');
+  });
+
+  it('should call searchIndexService.indexProduct on toggleAvailability', async () => {
+    const { service, catRepo, searchIdx } = createService();
+    catRepo.findProductById.mockResolvedValue(MOCK_PRODUCT);
+    catRepo.updateProduct.mockResolvedValue({ ...MOCK_PRODUCT, isAvailable: false });
+    await service.toggleAvailability('prd_abc', 'usr_owner', { isAvailable: false });
+    expect(searchIdx.indexProduct).toHaveBeenCalledWith('prd_abc');
+  });
+
+  it('should reindex merchant products on category name update', async () => {
+    const { service, catRepo, searchIdx } = createService();
+    catRepo.findCategoryById.mockResolvedValue(MOCK_CATEGORY);
+    catRepo.updateCategory.mockResolvedValue({ ...MOCK_CATEGORY, name: 'New Name' });
+    await service.updateCategory('cat_abc', 'usr_owner', { name: 'New Name' });
+    expect(searchIdx.reindexMerchantProducts).toHaveBeenCalledWith('mch_abc');
   });
 });
 
