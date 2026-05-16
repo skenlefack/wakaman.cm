@@ -8,7 +8,7 @@
 | Auth | **Complet** (3/3 features) | 2026-05-16 | Signup, login, refresh, logout, logout-all, sessions, cleanup |
 | Clients | Non commencé | — | Profil client, adresses, favoris |
 | Couriers | Non commencé | — | Onboarding, KYC, position temps réel |
-| Merchants | Non commencé | — | Onboarding, catalogue, horaires |
+| Merchants | Partiel — feature 1/3 (CRUD, team, hours) | 2026-05-16 | Catalog (products/categories) et géo-search restants |
 | Catalog | Non commencé | — | Produits, catégories, options |
 | Orders | Non commencé | — | Création, state machine, assignation |
 | Payments | Non commencé | — | MTN MoMo, Orange Money, wallet |
@@ -204,16 +204,73 @@
 
 ---
 
-### Merchants
+### Merchants (feature 1/3 — CRUD, team, hours)
 
-- **Rôle et responsabilité** : Onboarding marchands, gestion multi-utilisateurs, horaires, taux de commission.
-- **Endpoints exposés** : À définir
-- **Modèles de données utilisés** : `Merchant`, `MerchantUser`, `User`
-- **Décisions d'architecture** : À documenter
-- **Dépendances vers d'autres modules** : Users, Auth
-- **Points de vigilance / dette technique connue** : À documenter
-- **Comment tester manuellement** : À documenter
-- **Statut des tests automatisés** : Aucun test écrit
+- **Rôle et responsabilité** : CRUD marchands, gestion d'équipe (OWNER/MANAGER/STAFF), horaires d'ouverture. Feature 2 = produits/catégories. Feature 3 = géo-search Meilisearch.
+- **Endpoints exposés** :
+
+| Méthode | Route | Auth | Description |
+|---------|-------|------|-------------|
+| GET | `/api/v1/merchants` | Non | Liste publique ACTIVE, filtres city/type/search |
+| GET | `/api/v1/merchants/:id` | Non | Détail public (ACTIVE uniquement, cache Redis 5min) |
+| GET | `/api/v1/merchants/:id/hours` | Non | Horaires d'ouverture |
+| POST | `/api/v1/merchants` | JWT | Créer un marchand (créateur = OWNER, status PENDING) |
+| PATCH | `/api/v1/merchants/:id` | JWT + member | Modifier infos (tous rôles) |
+| PUT | `/api/v1/merchants/:id/hours` | JWT + member | Remplacer les horaires (7 jours, transaction) |
+| POST | `/api/v1/merchants/:id/pause` | JWT + member | Passer en PAUSED |
+| POST | `/api/v1/merchants/:id/resume` | JWT + member | Repasser ACTIVE depuis PAUSED |
+| GET | `/api/v1/merchants/:id/team` | JWT + member | Lister l'équipe |
+| POST | `/api/v1/merchants/:id/team` | JWT + OWNER | Ajouter un membre (par phone) |
+| DELETE | `/api/v1/merchants/:id/team/:userId` | JWT + OWNER | Retirer un membre |
+| POST | `/api/v1/merchants/:id/approve` | JWT + ADMIN | Approuver (PENDING → ACTIVE) |
+| POST | `/api/v1/merchants/:id/suspend` | JWT + ADMIN | Suspendre |
+| GET | `/api/v1/admin/merchants` | JWT + ADMIN | Liste admin (tous statuts, tous filtres) |
+
+- **Modèles de données utilisés** : `Merchant`, `MerchantUser`, `MerchantHours`, `User` (via AuthRepository pour findUserByPhone)
+- **Décisions d'architecture** :
+  1. **Rôles informatifs sauf OWNER pour team** : OWNER, MANAGER, STAFF sont tous autorisés à modifier le marchand (PATCH, hours, pause/resume). Seul OWNER peut gérer l'équipe (add/remove members). Alternative rejetée : permissions granulaires par rôle (RBAC complet overkill pour Phase 1, 1-3 personnes par marchand).
+  2. **Membership via preHandler composable** : `requireMerchantMember` et `requireMerchantOwner` sont des fonctions dans le fichier routes, pas des décorateurs globaux. Ils appellent `MerchantsService.verifyMembership()`. Alternative rejetée : décorateur Fastify global (trop couplé, pas réutilisable par module).
+  3. **Création atomique (transaction Prisma)** : `Merchant` + `MerchantUser(OWNER)` sont créés dans une seule `$transaction`. Pas de marchand orphelin si l'insertion du membership échoue. Le marchand naît en PENDING et n'apparaît pas dans les requêtes publiques tant qu'un admin n'a pas appelé POST /:id/approve.
+  4. **Multi-marchand par user : pas de limite** : un user peut être OWNER de plusieurs marchands. Pas de contrainte — un restaurateur peut avoir 2 enseignes. À réévaluer si abus constaté en production.
+  5. **addTeamMember : 409 ConflictError (pas idempotent)** : si le user est déjà membre, erreur 409 explicite. Choix : l'ajout est intentionnel, un 200 silencieux masquerait une erreur de logique côté client (ex: vouloir changer le rôle). Race condition P2002 attrapée en plus du check préalable.
+  6. **PUT hours = replace all** : pas de PATCH par jour. Les 7 jours sont envoyés d'un bloc en transaction (deleteMany + createMany). Simple, évite les états incohérents. Le client mobile envoie toujours les 7 jours.
+  7. **Cache Redis GET /:id public (5 min)** : invalidé sur PATCH, pause, resume, approve, suspend, updateHours. Pas de cache sur la liste (filtres trop variés, cache hit rate trop faible).
+  8. **Meilisearch différé** : recherche basique ILIKE sur businessName pour Phase 1. Meilisearch (full-text + géo + typo tolerance) = feature 3 du module Catalog.
+- **Dépendances vers d'autres modules** : Auth (AuthRepository.findUserByPhone pour ajout membre par phone)
+- **Points de vigilance / dette technique connue** :
+  - **Type user CLIENT → MERCHANT** : un CLIENT qui crée un marchand reste CLIENT. Question ouverte : un user a-t-il un type unique ou peut-il être à la fois CLIENT et MERCHANT ? À trancher. Ne bloque pas le fonctionnement actuel.
+  - **Cascade suspension → orders** : quand un marchand est suspendu, les commandes en cours devraient être annulées. Module Orders pas encore implémenté. TODO marqué dans le code.
+  - **Pas de DELETE public** : pas d'endpoint pour supprimer un marchand. Le suspend admin couvre 99% des cas. CLOSED = future feature si nécessaire.
+  - **commissionRate, momoNumber non modifiables** : pas exposés dans PATCH (admin-only plus tard). Sécurité : un marchand ne peut pas modifier son taux de commission.
+- **Comment tester manuellement** :
+  ```bash
+  # 1. Créer un marchand (authentifié)
+  curl -X POST http://localhost:3000/api/v1/merchants \
+    -H "Authorization: Bearer <token>" \
+    -H "Content-Type: application/json" \
+    -d '{"businessName":"Chez Mama","type":"RESTAURANT","addressLabel":"Marché Central","city":"Douala","latitude":4.05,"longitude":9.77,"phonePrimary":"+237691234567"}'
+  # → status: PENDING, créateur = OWNER
+
+  # 2. (Admin) Approuver
+  curl -X POST http://localhost:3000/api/v1/merchants/mch_xxx/approve \
+    -H "Authorization: Bearer <adminToken>"
+
+  # 3. Liste publique (pas d'auth)
+  curl "http://localhost:3000/api/v1/merchants?city=Douala&type=RESTAURANT"
+
+  # 4. Ajouter un membre à l'équipe (OWNER)
+  curl -X POST http://localhost:3000/api/v1/merchants/mch_xxx/team \
+    -H "Authorization: Bearer <ownerToken>" \
+    -H "Content-Type: application/json" \
+    -d '{"phone":"+237699999999","role":"STAFF"}'
+
+  # 5. Mettre à jour les horaires
+  curl -X PUT http://localhost:3000/api/v1/merchants/mch_xxx/hours \
+    -H "Authorization: Bearer <memberToken>" \
+    -H "Content-Type: application/json" \
+    -d '{"hours":[{"dayOfWeek":0,"openTime":"00:00","closeTime":"00:00","isClosed":true},{"dayOfWeek":1,"openTime":"08:00","closeTime":"22:00"},{"dayOfWeek":2,"openTime":"08:00","closeTime":"22:00"},{"dayOfWeek":3,"openTime":"08:00","closeTime":"22:00"},{"dayOfWeek":4,"openTime":"08:00","closeTime":"22:00"},{"dayOfWeek":5,"openTime":"08:00","closeTime":"22:00"},{"dayOfWeek":6,"openTime":"08:00","closeTime":"20:00"}]}'
+  ```
+- **Statut des tests automatisés** : 29 tests unitaires couvrant : create (OWNER auto), update (cache invalidation), membership verify (member OK, non-member 403), add team (by phone, not registered, already member), remove team (STAFF OK, OWNER rejected, self rejected), approve (PENDING→ACTIVE, not PENDING rejected), suspend (cache), list public (ACTIVE only, filtres city/type/search/combinés), GET /:id (ACTIVE, PENDING→404, cache hit), hours (replace 7 days + cache), pause/resume (state guards)
 
 ---
 

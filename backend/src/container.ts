@@ -24,6 +24,8 @@ import { FakeSmsProvider } from './providers/sms/fake-sms.provider.js';
 import type { SmsProvider } from './providers/sms/sms.provider.js';
 import { UsersRepository } from './modules/users/users.repository.js';
 import { UsersService } from './modules/users/users.service.js';
+import { MerchantsRepository } from './modules/merchants/merchants.repository.js';
+import { MerchantsService } from './modules/merchants/merchants.service.js';
 
 // ============================================================
 // CRÉATION DES INSTANCES SINGLETON
@@ -64,6 +66,10 @@ export interface AppContainer {
   usersRepository: UsersRepository;
   usersService: UsersService;
 
+  // Merchants module
+  merchantsRepository: MerchantsRepository;
+  merchantsService: MerchantsService;
+
   // TODO: register as modules are implemented
   // ordersService: OrdersService;
   // ...
@@ -96,6 +102,10 @@ container.register({
   // Users module (scoped per request)
   usersRepository: asClass(UsersRepository).scoped(),
   usersService: asClass(UsersService).scoped(),
+
+  // Merchants module (scoped per request)
+  merchantsRepository: asClass(MerchantsRepository).scoped(),
+  merchantsService: asClass(MerchantsService).scoped(),
 });
 
 // ============================================================
