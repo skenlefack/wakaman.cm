@@ -5,7 +5,7 @@
 | Module | Statut | Dernière mise à jour | Notes |
 |--------|--------|----------------------|-------|
 | Users | Partiel — routes/schemas uniquement | 2026-05-16 | Handlers, service, repository à implémenter |
-| Auth | Partiel — signup + login OTP (features 1-2/3) | 2026-05-16 | Refresh/logout/sessions (feature 3) restant |
+| Auth | **Complet** (3/3 features) | 2026-05-16 | Signup, login, refresh, logout, logout-all, sessions, cleanup |
 | Clients | Non commencé | — | Profil client, adresses, favoris |
 | Couriers | Non commencé | — | Onboarding, KYC, position temps réel |
 | Merchants | Non commencé | — | Onboarding, catalogue, horaires |
@@ -57,8 +57,10 @@
 | POST | `/api/v1/auth/verify-otp` | Non | Vérifie l'OTP, crée le compte, retourne JWT tokens (auto-login) | Implémenté |
 | POST | `/api/v1/auth/login` | Non | Connexion par OTP (envoie un code). Rejette numéros non inscrits, suspendus, bannis | Implémenté |
 | POST | `/api/v1/auth/verify-login-otp` | Non | Vérifie OTP login, crée Session, retourne `{ user, accessToken, refreshToken }` | Implémenté |
-| POST | `/api/v1/auth/refresh` | Refresh token | Renouvelle l'access token (réutilise TokenService) | TODO feature 3 |
-| POST | `/api/v1/auth/logout` | JWT | Révoque la session | TODO feature 3 |
+| POST | `/api/v1/auth/refresh` | Non (rate limited) | Échange refresh token → nouveau token pair (rotation). Vérifie session + statut compte | Implémenté |
+| POST | `/api/v1/auth/logout` | JWT | Révoque la session associée au refresh token fourni. Idempotent | Implémenté |
+| POST | `/api/v1/auth/logout-all` | JWT | Révoque toutes les sessions actives de l'utilisateur | Implémenté |
+| GET | `/api/v1/auth/sessions` | JWT | Liste les sessions actives (device, IP, date) pour écran "appareils connectés" | Implémenté |
 
 - **Modèles de données utilisés** : `User`, `Session`, `OTPCode`
 - **Décisions d'architecture** :
@@ -75,10 +77,16 @@
   11. **Double vérification du statut SUSPENDED/BANNED** : vérifié à la fois dans `login()` (avant envoi OTP, pour ne pas gaspiller un SMS) et dans `verifyLoginOtp()` (après OTP valide, car le statut peut changer entre les deux appels). Alternative rejetée : vérifier uniquement dans login (race condition si l'admin suspend entre l'envoi OTP et la vérification).
   12. **OTP purpose séparé LOGIN vs SIGNUP** : les OTP login utilisent `purpose: 'LOGIN'`, distincts de `'SIGNUP'`. `invalidatePendingOtps` ne cible que le purpose courant — un OTP signup en cours n'est pas invalidé par une tentative login et vice-versa.
   13. **`updateLastLogin` au verify, pas au login** : `lastLoginAt` et `lastLoginIp` sont mis à jour uniquement quand le login réussit (OTP vérifié), pas quand le code est demandé. Reflète la réalité de la connexion.
+  14. **Rotation du refresh token avec grace window Redis (30s)** : chaque refresh révoque l'ancien token et en émet un nouveau. La nouvelle paire de tokens est cachée dans Redis pendant 30s, clé = SHA-256 de l'ancien token, TTL = `REFRESH_GRACE_PERIOD_SECONDS`. Si un token révoqué est reçu et que Redis contient encore la paire de remplacement → retry transparent (la même paire est retournée, pas de re-rotation, pas d'all-revoke). Si Redis est vide (grace expirée) → détection de vol → toutes les sessions révoquées. Critique pour la 3G au Cameroun où la réponse HTTP peut se perdre après rotation côté serveur. Une seule constante `REFRESH_GRACE_PERIOD_SECONDS = 30` contrôle le TTL Redis et la fenêtre. Alternative rejetée A : token fixe sans rotation (pas de détection de vol). Alternative rejetée B : confirmation pending/confirmed (60-80 lignes + migration Prisma, complexité disproportionnée).
+  15. **Max 5 sessions actives par utilisateur** : au-delà de 5 sessions non-révoquées non-expirées, la plus ancienne est automatiquement révoquée lors de la création d'une nouvelle (dans `generateTokenPair`). Alternative rejetée : limite stricte avec erreur (mauvaise UX — l'utilisateur ne sait pas quel appareil déconnecter).
+  16. **Logout idempotent** : `POST /auth/logout` réussit silencieusement même si le token est déjà révoqué ou inexistant. Pas d'erreur 4xx — le résultat souhaité (session révoquée) est atteint dans tous les cas. Alternative rejetée : erreur 404 si token inconnu (fragilise les clients qui font du logout défensif).
+  17. **POST /auth/refresh sans authenticate** : le refresh token est envoyé dans le body, pas via JWT. L'access token peut être expiré (c'est le use case principal du refresh). Rate limited à 5/min/IP comme les autres routes auth.
+  18. **Purge sessions/OTP : logique prête, scheduler à brancher** : `AuthService.purgeExpired()` supprime les sessions expirées/révoquées et les OTP expirés. La fonction est appelable mais pas encore branchée sur un cron. À connecter via un scheduler (node-cron ou RabbitMQ delayed message) quand l'infra le permet.
+  19. **Soft revoke (revokedAt, pas DELETE)** : les sessions révoquées gardent leur ligne en DB avec `revokedAt` renseigné. Permet l'audit et la détection de réutilisation de token. Le cleanup (purge) supprime physiquement les lignes expirées/révoquées plus tard.
 - **Dépendances vers d'autres modules** : Aucune (crée les Users directement via son propre repository)
 - **Points de vigilance / dette technique connue** :
   - Le rate limit auth (5/min/IP) est déclaré au niveau route via `config.rateLimit` — nécessite que `@fastify/rate-limit` supporte le override par route (vérifié OK avec Fastify 5)
-  - Les OTP expirés ne sont pas nettoyés automatiquement — prévoir un cron/job de purge
+  - Purge OTP/sessions : `AuthService.purgeExpired()` est prête, mais pas encore branchée sur un scheduler (node-cron, RabbitMQ delayed, ou GCP Cloud Scheduler)
   - Le `jwtSign` est enregistré dans le container depuis `server.ts` (après le plugin JWT) — les classes scoped ne sont résolues qu'au moment de la requête, donc le timing est correct
 - **Comment tester manuellement** :
   ```bash
@@ -109,8 +117,29 @@
   # 5. Utiliser l'access token pour les requêtes authentifiées
   curl http://localhost:3000/api/v1/users/me \
     -H "Authorization: Bearer <accessToken>"
+
+  # 6. Rafraîchir les tokens (access expiré → utiliser le refresh token)
+  curl -X POST http://localhost:3000/api/v1/auth/refresh \
+    -H "Content-Type: application/json" \
+    -d '{"refreshToken": "<refreshToken>"}'
+  # → {"accessToken":"eyJ...","refreshToken":"b2c3d4..."}  (ancien token révoqué)
+
+  # 7. Lister les sessions actives
+  curl http://localhost:3000/api/v1/auth/sessions \
+    -H "Authorization: Bearer <accessToken>"
+  # → {"sessions":[{"id":"ses_...","deviceType":"android",...}]}
+
+  # 8. Logout session courante
+  curl -X POST http://localhost:3000/api/v1/auth/logout \
+    -H "Authorization: Bearer <accessToken>" \
+    -H "Content-Type: application/json" \
+    -d '{"refreshToken": "<refreshToken>"}'
+
+  # 9. Logout toutes les sessions
+  curl -X POST http://localhost:3000/api/v1/auth/logout-all \
+    -H "Authorization: Bearer <accessToken>"
   ```
-- **Statut des tests automatisés** : 14 tests unitaires (login + verify-login-otp) couvrant : succès, phone inexistant, phone non vérifié, compte SUSPENDED, compte BANNED, OTP expiré, OTP déjà utilisé, max tentatives, code invalide, tentatives restantes, user supprimé entre login et verify, device info
+- **Statut des tests automatisés** : 34 tests unitaires couvrant login (5), verify-login-otp (11), refresh (9 dont grace window Redis + retry 3G), logout (4), logout-all (1), sessions (3), cleanup (1). Cas clés : retry 3G transparent dans grace window, all-revoke hors grace window, token révoqué/expiré, compte suspendu/banni, logout puis refresh échoue
 
 ---
 
@@ -264,3 +293,6 @@
 | Hash OTP | SHA-256 (crypto natif) | bcrypt | OTP 6 chiffres à faible entropie, protégé par rate limit + max attempts; bcrypt lent sans bénéfice |
 | Token generation | TokenService (DI) + fastify.jwt.sign bridgé | jsonwebtoken, fast-jwt | Réutilise le plugin @fastify/jwt déjà configuré; fonction injectée via container pour découplage |
 | Refresh token storage | SHA-256 hash en DB | Stockage en clair | Si DB compromise, tokens inexploitables; même pattern que les OTP |
+| Refresh token rotation | Rotation + grace window Redis 30s | Token fixe 7j / rotation sans grace | Détection de vol après 30s; retry transparent pendant 30s (3G Cameroun) |
+| Max sessions | 5 par utilisateur, plus ancienne révoquée auto | Pas de limite / erreur | Évite accumulation; UX transparente (pas de message d'erreur) |
+| Session revocation | Soft revoke (revokedAt) | Hard delete | Audit trail, détection réutilisation; purge physique différée |

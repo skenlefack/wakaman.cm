@@ -1,15 +1,9 @@
 /**
  * Auth module — Routes Fastify
  *
- * Feature 1/3: Signup by OTP SMS
- * - POST /auth/signup            — Send OTP to phone
- * - POST /auth/verify-otp        — Verify OTP, create user, return tokens
- *
- * Feature 2/3: Login by OTP SMS
- * - POST /auth/login             — Send login OTP to existing user
- * - POST /auth/verify-login-otp  — Verify OTP, create session, return tokens
- *
- * Feature 3/3 (TODO): Logout + refresh + session management
+ * Feature 1: Signup by OTP SMS
+ * Feature 2: Login by OTP SMS
+ * Feature 3: Refresh, logout, session management
  */
 
 import { FastifyPluginAsyncTypebox } from '@fastify/type-provider-typebox';
@@ -105,6 +99,78 @@ const authRoutes: FastifyPluginAsyncTypebox = async (fastify) => {
       },
     },
     handler: handlers.verifyLoginOtp,
+  });
+
+  // ============================================================
+  // POST /auth/refresh — Rotate tokens (NOT authenticated — access may be expired)
+  // ============================================================
+  fastify.post('/auth/refresh', {
+    ...authRateLimit,
+    schema: {
+      tags: ['Auth'],
+      summary: 'Refresh access token',
+      description: 'Exchanges a valid refresh token for a new token pair. The old refresh token is revoked (rotation).',
+      body: schemas.RefreshBody,
+      response: {
+        200: schemas.RefreshResponse,
+        401: schemas.ErrorResponse,
+        403: schemas.ErrorResponse,
+        429: schemas.ErrorResponse,
+      },
+    },
+    handler: handlers.refresh,
+  });
+
+  // ============================================================
+  // POST /auth/logout — Revoke current session (authenticated)
+  // ============================================================
+  fastify.post('/auth/logout', {
+    schema: {
+      tags: ['Auth'],
+      summary: 'Logout current session',
+      description: 'Revokes the session associated with the provided refresh token. Idempotent.',
+      body: schemas.RefreshBody,
+      response: {
+        200: schemas.MessageResponse,
+      },
+      security: [{ bearerAuth: [] }],
+    },
+    preHandler: [fastify.authenticate],
+    handler: handlers.logout,
+  });
+
+  // ============================================================
+  // POST /auth/logout-all — Revoke all sessions (authenticated)
+  // ============================================================
+  fastify.post('/auth/logout-all', {
+    schema: {
+      tags: ['Auth'],
+      summary: 'Logout all sessions',
+      description: 'Revokes all active sessions for the authenticated user.',
+      response: {
+        200: schemas.MessageResponse,
+      },
+      security: [{ bearerAuth: [] }],
+    },
+    preHandler: [fastify.authenticate],
+    handler: handlers.logoutAll,
+  });
+
+  // ============================================================
+  // GET /auth/sessions — List active sessions (authenticated)
+  // ============================================================
+  fastify.get('/auth/sessions', {
+    schema: {
+      tags: ['Auth'],
+      summary: 'List active sessions',
+      description: 'Returns all active (non-revoked, non-expired) sessions for the authenticated user.',
+      response: {
+        200: schemas.SessionsListResponse,
+      },
+      security: [{ bearerAuth: [] }],
+    },
+    preHandler: [fastify.authenticate],
+    handler: handlers.getSessions,
   });
 };
 

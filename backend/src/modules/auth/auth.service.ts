@@ -2,8 +2,7 @@
  * Auth module — Service (business logic)
  *
  * Handles OTP generation, verification, user creation (signup),
- * and login via OTP with auto-login (token generation).
- * Refresh/logout will be added in feature 3.
+ * login via OTP, logout, sessions listing, and cleanup.
  */
 
 import { createHash, randomInt } from 'node:crypto';
@@ -11,7 +10,7 @@ import type { Logger } from 'pino';
 import { Prisma } from '@prisma/client';
 import { ConflictError, ForbiddenError, OtpError, UnauthorizedError } from '../../lib/errors.js';
 import type { AuthRepository } from './auth.repository.js';
-import type { TokenService } from './token.service.js';
+import { TokenService } from './token.service.js';
 import type { DeviceInfo } from './token.service.js';
 import type { SmsProvider } from '../../providers/sms/sms.provider.js';
 import { OTP_LENGTH, OTP_EXPIRY_MINUTES, OTP_MAX_ATTEMPTS } from './auth.types.js';
@@ -254,6 +253,59 @@ export class AuthService {
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
     };
+  }
+
+  // ============================================================
+  // LOGOUT
+  // ============================================================
+
+  async logout(refreshToken: string): Promise<void> {
+    const hash = TokenService.hashToken(refreshToken);
+    const session = await this.authRepository.findSessionByRefreshTokenHash(hash);
+
+    if (!session || session.revokedAt) {
+      // Silently succeed — logout is idempotent
+      return;
+    }
+
+    await this.authRepository.revokeSession(session.id);
+    this.logger.info({ userId: session.userId, sessionId: session.id }, 'Session revoked (logout)');
+  }
+
+  async logoutAll(userId: string): Promise<number> {
+    const count = await this.authRepository.revokeAllUserSessions(userId);
+    this.logger.info({ userId, revokedCount: count }, 'All sessions revoked (logout-all)');
+    return count;
+  }
+
+  // ============================================================
+  // SESSIONS
+  // ============================================================
+
+  async getActiveSessions(userId: string, currentRefreshTokenHash?: string) {
+    const sessions = await this.authRepository.findActiveSessions(userId);
+
+    return sessions.map((s) => ({
+      id: s.id,
+      deviceType: s.deviceType ?? undefined,
+      deviceName: s.deviceName ?? undefined,
+      appVersion: s.appVersion ?? undefined,
+      ipAddress: s.ipAddress ?? undefined,
+      userAgent: s.userAgent ?? undefined,
+      createdAt: s.createdAt.toISOString(),
+      current: currentRefreshTokenHash ? s.refreshToken === currentRefreshTokenHash : false,
+    }));
+  }
+
+  // ============================================================
+  // CLEANUP (to be wired to a scheduler later)
+  // ============================================================
+
+  async purgeExpired(): Promise<{ sessions: number; otps: number }> {
+    const sessions = await this.authRepository.purgeExpiredSessions();
+    const otps = await this.authRepository.purgeExpiredOtps();
+    this.logger.info({ sessions, otps }, 'Purged expired sessions and OTPs');
+    return { sessions, otps };
   }
 
   // ============================================================

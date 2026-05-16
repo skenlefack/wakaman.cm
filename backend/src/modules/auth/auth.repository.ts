@@ -4,7 +4,7 @@
  * Data access for OTPCode and User creation during signup.
  */
 
-import type { PrismaClient, User, OTPCode } from '@prisma/client';
+import type { PrismaClient, User, OTPCode, Session } from '@prisma/client';
 import type { OtpPurpose } from './auth.types.js';
 
 export class AuthRepository {
@@ -115,5 +115,86 @@ export class AuthRepository {
         lastLoginIp: ipAddress,
       },
     });
+  }
+
+  async findUserById(userId: string): Promise<User | null> {
+    return this.prisma.user.findUnique({ where: { id: userId } });
+  }
+
+  // ============================================================
+  // SESSIONS
+  // ============================================================
+
+  async findSessionByRefreshTokenHash(hash: string): Promise<Session | null> {
+    return this.prisma.session.findUnique({ where: { refreshToken: hash } });
+  }
+
+  async revokeSession(sessionId: string): Promise<void> {
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  async revokeAllUserSessions(userId: string): Promise<number> {
+    const result = await this.prisma.session.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    return result.count;
+  }
+
+  async findActiveSessions(userId: string): Promise<Session[]> {
+    return this.prisma.session.findMany({
+      where: {
+        userId,
+        revokedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async countActiveSessions(userId: string): Promise<number> {
+    return this.prisma.session.count({
+      where: {
+        userId,
+        revokedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+    });
+  }
+
+  async revokeOldestSession(userId: string): Promise<void> {
+    const oldest = await this.prisma.session.findFirst({
+      where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (oldest) {
+      await this.revokeSession(oldest.id);
+    }
+  }
+
+  // ============================================================
+  // CLEANUP (expired sessions & OTPs)
+  // ============================================================
+
+  async purgeExpiredSessions(): Promise<number> {
+    const result = await this.prisma.session.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lt: new Date() } },
+          { revokedAt: { not: null } },
+        ],
+      },
+    });
+    return result.count;
+  }
+
+  async purgeExpiredOtps(): Promise<number> {
+    const result = await this.prisma.oTPCode.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    return result.count;
   }
 }
