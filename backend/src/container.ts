@@ -26,6 +26,8 @@ import { UsersRepository } from './modules/users/users.repository.js';
 import { UsersService } from './modules/users/users.service.js';
 import { MerchantsRepository } from './modules/merchants/merchants.repository.js';
 import { MerchantsService } from './modules/merchants/merchants.service.js';
+import { CatalogRepository } from './modules/catalog/catalog.repository.js';
+import { CatalogService } from './modules/catalog/catalog.service.js';
 
 // ============================================================
 // CRÉATION DES INSTANCES SINGLETON
@@ -70,6 +72,10 @@ export interface AppContainer {
   merchantsRepository: MerchantsRepository;
   merchantsService: MerchantsService;
 
+  // Catalog module
+  catalogRepository: CatalogRepository;
+  catalogService: CatalogService;
+
   // TODO: register as modules are implemented
   // ordersService: OrdersService;
   // ...
@@ -106,6 +112,10 @@ container.register({
   // Merchants module (scoped per request)
   merchantsRepository: asClass(MerchantsRepository).scoped(),
   merchantsService: asClass(MerchantsService).scoped(),
+
+  // Catalog module (scoped per request)
+  catalogRepository: asClass(CatalogRepository).scoped(),
+  catalogService: asClass(CatalogService).scoped(),
 });
 
 // ============================================================

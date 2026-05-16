@@ -9,7 +9,7 @@
 | Clients | Non commencé | — | Profil client, adresses, favoris |
 | Couriers | Non commencé | — | Onboarding, KYC, position temps réel |
 | Merchants | Partiel — feature 1/3 (CRUD, team, hours) | 2026-05-16 | Catalog (products/categories) et géo-search restants |
-| Catalog | Non commencé | — | Produits, catégories, options |
+| Catalog | Partiel — feature 2/3 (categories, products, options) | 2026-05-16 | Géo-search Meilisearch = feature 3 |
 | Orders | Non commencé | — | Création, state machine, assignation |
 | Payments | Non commencé | — | MTN MoMo, Orange Money, wallet |
 | Tracking | Non commencé | — | WebSocket, position coursier |
@@ -274,16 +274,50 @@
 
 ---
 
-### Catalog
+### Catalog (feature 2/3 — categories, products, options, choices)
 
-- **Rôle et responsabilité** : Gestion des produits, catégories, options et choix d'options par marchand.
-- **Endpoints exposés** : À définir
+- **Rôle et responsabilité** : CRUD catégories, produits, options et choix pour chaque marchand. Feature 3 = géo-search Meilisearch.
+- **Endpoints exposés** :
+
+| Méthode | Route | Auth | Description |
+|---------|-------|------|-------------|
+| GET | `/api/v1/merchants/:merchantId/categories` | Non | Liste catégories actives |
+| GET | `/api/v1/merchants/:merchantId/products` | Non | Produits disponibles (cached 2min), filtre categoryId |
+| GET | `/api/v1/products/:id` | Non | Détail produit + options + choices |
+| POST | `/api/v1/merchants/:merchantId/categories` | JWT + member | Créer catégorie (max 10) |
+| PATCH | `/api/v1/categories/:id` | JWT + member | Modifier catégorie |
+| DELETE | `/api/v1/categories/:id` | JWT + member | Supprimer (409 si produits attachés) |
+| POST | `/api/v1/merchants/:merchantId/categories/reorder` | JWT + member | Réordonner (array d'IDs) |
+| POST | `/api/v1/merchants/:merchantId/products` | JWT + member | Créer produit (max 200) |
+| PATCH | `/api/v1/products/:id` | JWT + member | Modifier produit |
+| DELETE | `/api/v1/products/:id` | JWT + member | Soft delete (deletedAt + isAvailable=false) |
+| POST | `/api/v1/products/:id/availability` | JWT + member | Toggle dispo rapide |
+| POST | `/api/v1/products/:id/options` | JWT + member | Ajouter option (max 5) |
+| PATCH | `/api/v1/options/:id` | JWT + member | Modifier option |
+| DELETE | `/api/v1/options/:id` | JWT + member | Supprimer option + choices (cascade) |
+| POST | `/api/v1/options/:id/choices` | JWT + member | Ajouter choix (max 10) |
+| PATCH | `/api/v1/choices/:id` | JWT + member | Modifier choix |
+| DELETE | `/api/v1/choices/:id` | JWT + member | Supprimer choix |
+
 - **Modèles de données utilisés** : `Category`, `Product`, `ProductOption`, `ProductOptionChoice`
-- **Décisions d'architecture** : À documenter
-- **Dépendances vers d'autres modules** : Merchants
-- **Points de vigilance / dette technique connue** : À documenter
-- **Comment tester manuellement** : À documenter
-- **Statut des tests automatisés** : Aucun test écrit
+- **Décisions d'architecture** :
+  1. **Delete catégorie = refus si produits attachés (409)** : pas de détachement auto. Le marchand doit déplacer ou supprimer les produits d'abord. Plus sûr — pas de produits orphelins par accident. Alternative rejetée : détacher (categoryId=null) silencieusement.
+  2. **Soft delete produits** : `deletedAt + isAvailable=false`. Le produit reste en DB (référencé par OrderItem pour l'historique). Public ne le voit plus, admin/marchand le voit toujours.
+  3. **Membership vérifiée dans le service (pas preHandler)** : les routes PATCH/DELETE /categories/:id, /products/:id, etc. n'ont pas merchantId dans l'URL. Le service fetch la resource, extrait merchantId, puis appelle `verifyMembership`. Alternative rejetée : preHandler (pas assez de contexte dans les params URL).
+  4. **Options SINGLE/MULTIPLE validation** : SINGLE ��� maxSelection=1 obligatoire. MULTIPLE → maxSelection >= minSelection. Validé au create et update.
+  5. **Cache Redis pattern `catalog:{merchantId}:*`** : TTL 2min. Invalidation par `KEYS` + `DEL` sur pattern. OK pour MVP (< 200 marchands actifs, < 10 clés par marchand). À remplacer par Redis pub/sub ou tags si scale.
+  6. **Limites MVP** : 200 produits, 10 catégories, 5 options, 10 choices. Constantes dans `catalog.types.ts`, ajustables.
+  7. **Reorder categories = transaction** : array d'IDs → validation que tous appartiennent au même marchand → updateMany sortOrder en transaction. Rejet complet si un ID est alien.
+  8. **Ownership assertions factorisées** : 3 helpers privés (`assertOwnedProduct`, `assertOwnedOption`, `assertOwnedChoice`) fetch la resource, vérifient qu'elle existe/pas deleted, puis appellent `verifyMembership` avec le merchantId extrait. Pas de duplication.
+  9. **Suppressions et cascade** : DELETE /options/:id = hard delete Prisma → choices supprimées automatiquement (Prisma `onDelete: Cascade` sur `ProductOptionChoice`). DELETE /products/:id = **soft** delete (deletedAt + isAvailable=false) → options et choices préservées (nécessaires pour l'historique OrderItem). Pas d'orphelins.
+- **Dépendances vers d'autres modules** : Merchants (MerchantsService.verifyMembership)
+- **Points de vigilance / dette technique connue** :
+  - **Photos** : URLs acceptées en string. Upload fichiers vers GCS = module Storage futur.
+  - **Stock décrémentation** : non géré ici, relèvera du module Orders.
+  - **Recherche** : ILIKE basique dans le repo. Meilisearch = feature 3.
+  - **discountPriceFcfa** : validé < priceFcfa au create/update, mais pas de job qui vérifie la cohérence historique.
+  - **KEYS Redis** : pattern scan OK pour < 100 clés. À remplacer par SCAN si volume augmente.
+- **Statut des tests automatisés** : 23 tests unitaires couvrant : catégories (create, non-member 403, max limit, delete with products 409, reorder alien reject, reorder OK), produits (create, max limit, discount validation ×2, soft delete, non-member 403, public list, public detail deleted 404, unavailable 404, cache invalidation), options (create, SINGLE maxSel>1 error, MULTIPLE maxSel<minSel error, max limit, delete cascade choices), choices (create, max limit)
 
 ---
 
