@@ -146,11 +146,34 @@ export async function build(): Promise<FastifyInstance> {
   // AUTH HOOK (decorator pour les routes protégées)
   // ============================================================
 
+  const redis = container.resolve('redis');
+
   fastify.decorate('authenticate', async (request: any, reply: any) => {
     try {
       await request.jwtVerify();
     } catch (err) {
-      reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Invalid token' });
+      return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'Invalid token' });
+    }
+
+    // Check Redis blocklist for suspended/banned users
+    const user = request.user as { sub: string } | undefined;
+    if (user) {
+      try {
+        const blocked = await redis.get(`blocked:${user.sub}`);
+        if (blocked) {
+          return reply.code(403).send({ error: 'FORBIDDEN', message: 'Account suspended' });
+        }
+      } catch {
+        // Redis unavailable — fail-open (15 min max exposure, refresh blocks anyway)
+        request.log.warn({ userId: user.sub }, 'Redis blocklist check failed — fail-open');
+      }
+    }
+  });
+
+  fastify.decorate('requireAdmin', async (request: any, reply: any) => {
+    const user = request.user as { sub: string; type: string } | undefined;
+    if (!user || user.type !== 'ADMIN') {
+      reply.code(403).send({ error: 'FORBIDDEN', message: 'Admin access required' });
     }
   });
 

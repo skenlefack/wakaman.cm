@@ -1,13 +1,8 @@
 /**
  * Users module — Routes Fastify
  *
- * Endpoints:
- * - GET    /users          : Liste paginée (admin)
- * - GET    /users/:id      : Détail utilisateur
- * - POST   /users          : Créer un utilisateur
- * - PATCH  /users/:id      : Mettre à jour
- * - DELETE /users/:id      : Soft delete
- * - GET    /users/me       : Mon profil (utilisateur connecté)
+ * Profile management for authenticated users + admin operations.
+ * Auth routes (signup, login, refresh, etc.) are in the auth module.
  */
 
 import { FastifyPluginAsyncTypebox } from '@fastify/type-provider-typebox';
@@ -16,7 +11,7 @@ import * as schemas from './users.schemas.js';
 
 const usersRoutes: FastifyPluginAsyncTypebox = async (fastify) => {
   // ============================================================
-  // GET /users/me — Mon profil
+  // GET /users/me — My profile (cached in Redis)
   // ============================================================
   fastify.get('/users/me', {
     schema: {
@@ -29,29 +24,67 @@ const usersRoutes: FastifyPluginAsyncTypebox = async (fastify) => {
       security: [{ bearerAuth: [] }],
     },
     preHandler: [fastify.authenticate],
-    handler: handlers.getCurrentUser,
+    handler: handlers.getMyProfile,
   });
 
   // ============================================================
-  // GET /users/:id — Détail
+  // PATCH /users/me — Update my profile
   // ============================================================
-  fastify.get('/users/:id', {
+  fastify.patch('/users/me', {
     schema: {
       tags: ['Users'],
-      summary: 'Get user by ID',
-      params: schemas.UserIdParams,
+      summary: 'Update current user profile',
+      body: schemas.UpdateMyProfileBody,
       response: {
         200: schemas.UserResponse,
+        401: schemas.ErrorResponse,
         404: schemas.ErrorResponse,
       },
       security: [{ bearerAuth: [] }],
     },
     preHandler: [fastify.authenticate],
+    handler: handlers.updateMyProfile,
+  });
+
+  // ============================================================
+  // DELETE /users/me — Soft delete my account
+  // ============================================================
+  fastify.delete('/users/me', {
+    schema: {
+      tags: ['Users'],
+      summary: 'Delete my account (soft delete)',
+      description: 'Sets status to DELETED, sets deletedAt, revokes all sessions. Irreversible from user side.',
+      response: {
+        200: schemas.MessageResponse,
+        401: schemas.ErrorResponse,
+      },
+      security: [{ bearerAuth: [] }],
+    },
+    preHandler: [fastify.authenticate],
+    handler: handlers.deleteMyAccount,
+  });
+
+  // ============================================================
+  // GET /users/:id — Admin: get user by ID
+  // ============================================================
+  fastify.get('/users/:id', {
+    schema: {
+      tags: ['Users'],
+      summary: 'Get user by ID (admin only)',
+      params: schemas.UserIdParams,
+      response: {
+        200: schemas.UserResponse,
+        403: schemas.ErrorResponse,
+        404: schemas.ErrorResponse,
+      },
+      security: [{ bearerAuth: [] }],
+    },
+    preHandler: [fastify.authenticate, fastify.requireAdmin],
     handler: handlers.getUserById,
   });
 
   // ============================================================
-  // GET /users — Liste (admin only)
+  // GET /users — Admin: list users
   // ============================================================
   fastify.get('/users', {
     schema: {
@@ -64,62 +97,30 @@ const usersRoutes: FastifyPluginAsyncTypebox = async (fastify) => {
       },
       security: [{ bearerAuth: [] }],
     },
-    preHandler: [fastify.authenticate], // TODO: ajouter check admin role
+    preHandler: [fastify.authenticate, fastify.requireAdmin],
     handler: handlers.listUsers,
   });
 
   // ============================================================
-  // POST /users — Créer
+  // PATCH /users/:id/status — Admin: change user status
   // ============================================================
-  fastify.post('/users', {
+  fastify.patch('/users/:id/status', {
     schema: {
       tags: ['Users'],
-      summary: 'Create a new user',
-      body: schemas.CreateUserBody,
-      response: {
-        201: schemas.UserResponse,
-        400: schemas.ErrorResponse,
-        409: schemas.ErrorResponse,
-      },
-    },
-    handler: handlers.createUser,
-  });
-
-  // ============================================================
-  // PATCH /users/:id — Mettre à jour
-  // ============================================================
-  fastify.patch('/users/:id', {
-    schema: {
-      tags: ['Users'],
-      summary: 'Update user',
+      summary: 'Change user status (admin only)',
+      description: 'Suspend, ban, or reactivate a user. Admin cannot change own status.',
       params: schemas.UserIdParams,
-      body: schemas.UpdateUserBody,
+      body: schemas.UpdateUserStatusBody,
       response: {
         200: schemas.UserResponse,
+        400: schemas.ErrorResponse,
+        403: schemas.ErrorResponse,
         404: schemas.ErrorResponse,
       },
       security: [{ bearerAuth: [] }],
     },
-    preHandler: [fastify.authenticate],
-    handler: handlers.updateUser,
-  });
-
-  // ============================================================
-  // DELETE /users/:id — Soft delete
-  // ============================================================
-  fastify.delete('/users/:id', {
-    schema: {
-      tags: ['Users'],
-      summary: 'Soft delete user',
-      params: schemas.UserIdParams,
-      response: {
-        204: Type.Null(),
-        404: schemas.ErrorResponse,
-      },
-      security: [{ bearerAuth: [] }],
-    },
-    preHandler: [fastify.authenticate],
-    handler: handlers.deleteUser,
+    preHandler: [fastify.authenticate, fastify.requireAdmin],
+    handler: handlers.updateUserStatus,
   });
 };
 

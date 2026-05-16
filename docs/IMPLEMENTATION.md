@@ -4,7 +4,7 @@
 
 | Module | Statut | Dernière mise à jour | Notes |
 |--------|--------|----------------------|-------|
-| Users | Partiel — routes/schemas uniquement | 2026-05-16 | Handlers, service, repository à implémenter |
+| Users | **Complet** — CRUD profil + admin | 2026-05-16 | GET/PATCH/DELETE /me, GET/list admin, PATCH status admin |
 | Auth | **Complet** (3/3 features) | 2026-05-16 | Signup, login, refresh, logout, logout-all, sessions, cleanup |
 | Clients | Non commencé | — | Profil client, adresses, favoris |
 | Couriers | Non commencé | — | Onboarding, KYC, position temps réel |
@@ -23,26 +23,61 @@
 
 ### Users
 
-- **Rôle et responsabilité** : CRUD utilisateurs (tous types : CLIENT, COURIER, MERCHANT, ADMIN, SUPPORT). Module de base référencé par tous les autres.
+- **Rôle et responsabilité** : CRUD profil utilisateur authentifié + opérations admin (list, get, change status). Ne gère PAS l'inscription/connexion (module Auth).
 - **Endpoints exposés** :
 
 | Méthode | Route | Auth | Description |
 |---------|-------|------|-------------|
-| GET | `/api/v1/users/me` | JWT | Profil de l'utilisateur connecté |
+| GET | `/api/v1/users/me` | JWT | Profil de l'utilisateur connecté (cache Redis 5 min) |
+| PATCH | `/api/v1/users/me` | JWT | Modifier son profil (firstName, lastName, email, language, avatarUrl) |
+| DELETE | `/api/v1/users/me` | JWT | Soft delete de son compte (deletedAt + sessions révoquées) |
 | GET | `/api/v1/users/:id` | JWT + ADMIN | Récupérer un utilisateur par ID |
-| GET | `/api/v1/users` | JWT + ADMIN | Lister les utilisateurs (paginé) |
-| POST | `/api/v1/users` | JWT + ADMIN | Créer un utilisateur |
-| PATCH | `/api/v1/users/:id` | JWT + ADMIN/SELF | Modifier un utilisateur |
-| DELETE | `/api/v1/users/:id` | JWT + ADMIN | Supprimer un utilisateur (soft delete) |
+| GET | `/api/v1/users` | JWT + ADMIN | Lister les utilisateurs (paginé, filtres type/status/search) |
+| PATCH | `/api/v1/users/:id/status` | JWT + ADMIN | Suspendre, bannir ou réactiver un utilisateur |
 
-- **Modèles de données utilisés** : `User`, `Address`
-- **Décisions d'architecture** : À documenter lors de l'implémentation complète
-- **Dépendances vers d'autres modules** : Aucune (module de base)
+- **Modèles de données utilisés** : `User`, `Session` (via AuthRepository pour revoke)
+- **Décisions d'architecture** :
+  1. **Cache Redis sur GET /users/me (TTL 5 min)** : le profil est lu fréquemment (chaque ouverture d'app). Cache invalidé sur PATCH /me, DELETE /me, et PATCH /:id/status. Clé : `user:{userId}`. Alternative rejetée : cache HTTP (moins contrôlable côté invalidation).
+  2. **`requireAdmin` comme simple décorateur** : `fastify.requireAdmin` vérifie `request.user.type === 'ADMIN'`. Pas de RBAC complet — suffisant pour Phase 1. Le décorateur est séparé de `authenticate` pour pouvoir être composé (`preHandler: [authenticate, requireAdmin]`). RBAC à ajouter quand les rôles marchand/support auront besoin de permissions granulaires.
+  3. **Admin ne peut pas se ban lui-même** : `updateUserStatus` compare `targetUserId === adminUserId` → 400 `ValidationError`. Prévient le verrouillage accidentel. Alternative rejetée : autoriser (trop risqué, un seul admin en Phase 1).
+  4. **DELETE /me = soft delete + revoke all** : `deletedAt = now()`, `status = DELETED`, toutes les sessions révoquées. Le phone reste unique en base (l'utilisateur ne peut pas se réinscrire avec le même numéro). Pas de hard delete pour conformité/audit.
+  5. **Admin GET /:id retourne aussi les comptes DELETED** : contrairement à GET /me qui filtre `deletedAt: null`, l'admin voit tout. Utile pour le support.
+  6. **UsersService dépend de AuthRepository** : pour `revokeAllUserSessions` lors de DELETE /me et PATCH /:id/status (SUSPENDED/BANNED). Dépendance légitime — évite de dupliquer la logique de révocation.
+  7. **Redis blocklist pour invalidation immédiate des access tokens** : quand un user passe SUSPENDED/BANNED/DELETED, un `blocked:{userId}` est écrit dans Redis avec TTL 15 min (= durée access token). `fastify.authenticate` consulte cette clé après vérification JWT — si présente → 403 immédiat. Quand le user est réactivé, la clé est supprimée. Alternative rejetée : check DB du statut user sur chaque requête authentifiée (latence DB sur chaque requête, coûteux en connection pool).
+  8. **Fail-open explicite si Redis est indisponible** : le `try/catch` dans `fastify.authenticate` (server.ts L159-167) attrape toute erreur Redis (down, timeout, network) et laisse passer la requête avec un `request.log.warn`. Justification : (a) exposure max 15 min car l'access token expire naturellement, (b) le refresh endpoint vérifie le statut user en DB (hard gate), (c) un fail-closed (503) déconnecterait TOUS les utilisateurs si Redis tombe — inacceptable en production. Le log warn permet d'alerter via Sentry/monitoring sans impacter le trafic. Alternative rejetée : fail-closed / 503 (risque de déni de service global si Redis flap).
+- **Dépendances vers d'autres modules** : Auth (AuthRepository pour révocation sessions)
 - **Points de vigilance / dette technique connue** :
-  - Seuls `users.routes.ts` et `users.schemas.ts` existent — handlers, service, repository manquants
-  - Validation téléphone E.164 (+237XXXXXXXXX) déjà en place dans les schemas
-- **Comment tester manuellement** : À documenter après implémentation des handlers
-- **Statut des tests automatisés** : Aucun test écrit
+  - Email modifiable sans vérification — stocker l'email suffit pour Phase 1. Vérification email (envoi de lien) = feature future. Documenter dans le schema que `emailVerifiedAt` reste `null` tant que la vérification n'est pas implémentée.
+  - Pas de route POST /users (création admin) — les users sont créés via le signup OTP uniquement. À ajouter si besoin admin.
+  - Pas de PATCH /users/:id complet (admin edit) — seul le status est modifiable par admin pour l'instant.
+  - Le search dans GET /users est un ILIKE basique — pas de full-text search Meilisearch. Suffisant pour < 10K users.
+- **Comment tester manuellement** :
+  ```bash
+  # 1. Mon profil (authentifié)
+  curl http://localhost:3000/api/v1/users/me \
+    -H "Authorization: Bearer <accessToken>"
+
+  # 2. Modifier mon profil
+  curl -X PATCH http://localhost:3000/api/v1/users/me \
+    -H "Authorization: Bearer <accessToken>" \
+    -H "Content-Type: application/json" \
+    -d '{"firstName": "Pierre", "lastName": "Kamga"}'
+
+  # 3. Supprimer mon compte
+  curl -X DELETE http://localhost:3000/api/v1/users/me \
+    -H "Authorization: Bearer <accessToken>"
+
+  # 4. (Admin) Lister les utilisateurs
+  curl "http://localhost:3000/api/v1/users?type=CLIENT&page=1&pageSize=10" \
+    -H "Authorization: Bearer <adminAccessToken>"
+
+  # 5. (Admin) Suspendre un utilisateur
+  curl -X PATCH http://localhost:3000/api/v1/users/usr_abc123/status \
+    -H "Authorization: Bearer <adminAccessToken>" \
+    -H "Content-Type: application/json" \
+    -d '{"status": "SUSPENDED", "reason": "Abuse signalé"}'
+  ```
+- **Statut des tests automatisés** : 25 tests unitaires couvrant : GET /me (profil, cache, deleted), PATCH /me (update+invalidate, not found), DELETE /me (soft delete+revoke+invalidate+blocklist, already deleted), GET /:id admin (include deleted, not found), GET /users (pagination, defaults, filtre type, filtre status, filtre search, filtres combinés), PATCH status (suspend+revoke+blocklist, ban+revoke+blocklist, reactivate+remove blocklist, self-ban rejected, not found, cache invalidation), blocklist (delete adds to blocklist)
 
 ---
 
@@ -296,3 +331,6 @@
 | Refresh token rotation | Rotation + grace window Redis 30s | Token fixe 7j / rotation sans grace | Détection de vol après 30s; retry transparent pendant 30s (3G Cameroun) |
 | Max sessions | 5 par utilisateur, plus ancienne révoquée auto | Pas de limite / erreur | Évite accumulation; UX transparente (pas de message d'erreur) |
 | Session revocation | Soft revoke (revokedAt) | Hard delete | Audit trail, détection réutilisation; purge physique différée |
+| User profile cache | Redis `user:{id}` TTL 5min | Pas de cache / cache HTTP | Invalidation explicite sur write; fréquent read (ouverture app) |
+| Admin auth | Simple `requireAdmin` decorator | RBAC complet | Suffisant Phase 1 (1 admin); RBAC quand rôles granulaires nécessaires |
+| Access token revocation | Redis blocklist `blocked:{userId}` TTL 15min | Check DB sur chaque requête | Sub-ms Redis vs DB round-trip; fail-open si Redis down (15min max exposure) |

@@ -1,9 +1,7 @@
 /**
  * Users module — Schemas (TypeBox)
  *
- * Définition des contrats d'API du module Users.
- * TypeBox génère automatiquement les types TypeScript ET les JSON Schemas
- * pour la validation Fastify.
+ * Contrats d'API pour le CRUD profil utilisateur + admin.
  */
 
 import { Type, Static } from '@sinclair/typebox';
@@ -45,19 +43,7 @@ export const UserIdParams = Type.Object({
 // BODY DTOs
 // ============================================================
 
-export const CreateUserBody = Type.Object({
-  phone: Type.String({
-    pattern: '^\\+237[0-9]{9}$',
-    description: 'Phone number in E.164 format (+237XXXXXXXXX)',
-  }),
-  type: UserType,
-  firstName: Type.Optional(Type.String({ minLength: 2, maxLength: 50 })),
-  lastName: Type.Optional(Type.String({ minLength: 2, maxLength: 50 })),
-  email: Type.Optional(Type.String({ format: 'email' })),
-  language: Type.Optional(Language),
-});
-
-export const UpdateUserBody = Type.Partial(
+export const UpdateMyProfileBody = Type.Partial(
   Type.Object({
     firstName: Type.String({ minLength: 2, maxLength: 50 }),
     lastName: Type.String({ minLength: 2, maxLength: 50 }),
@@ -66,6 +52,15 @@ export const UpdateUserBody = Type.Partial(
     avatarUrl: Type.String({ format: 'uri' }),
   }),
 );
+
+export const UpdateUserStatusBody = Type.Object({
+  status: Type.Union([
+    Type.Literal('ACTIVE'),
+    Type.Literal('SUSPENDED'),
+    Type.Literal('BANNED'),
+  ]),
+  reason: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+});
 
 // ============================================================
 // RESPONSE
@@ -83,6 +78,7 @@ export const UserResponse = Type.Object({
   language: Language,
   phoneVerifiedAt: Type.Optional(Type.String({ format: 'date-time' })),
   emailVerifiedAt: Type.Optional(Type.String({ format: 'date-time' })),
+  lastLoginAt: Type.Optional(Type.String({ format: 'date-time' })),
   createdAt: Type.String({ format: 'date-time' }),
   updatedAt: Type.String({ format: 'date-time' }),
 });
@@ -101,6 +97,10 @@ export const ErrorResponse = Type.Object({
   requestId: Type.String(),
 });
 
+export const MessageResponse = Type.Object({
+  message: Type.String(),
+});
+
 // ============================================================
 // QUERY (pagination, filtres)
 // ============================================================
@@ -114,10 +114,10 @@ export const ListUsersQuery = Type.Object({
 });
 
 // ============================================================
-// TYPES INFERED (utilisables dans le code TypeScript)
+// INFERRED TYPES
 // ============================================================
 
 export type UserResponseType = Static<typeof UserResponse>;
-export type CreateUserBodyType = Static<typeof CreateUserBody>;
-export type UpdateUserBodyType = Static<typeof UpdateUserBody>;
+export type UpdateMyProfileBodyType = Static<typeof UpdateMyProfileBody>;
+export type UpdateUserStatusBodyType = Static<typeof UpdateUserStatusBody>;
 export type ListUsersQueryType = Static<typeof ListUsersQuery>;

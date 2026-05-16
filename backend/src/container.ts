@@ -22,6 +22,8 @@ import type { JwtSign } from './modules/auth/token.service.js';
 import { TwilioProvider } from './providers/sms/twilio.provider.js';
 import { FakeSmsProvider } from './providers/sms/fake-sms.provider.js';
 import type { SmsProvider } from './providers/sms/sms.provider.js';
+import { UsersRepository } from './modules/users/users.repository.js';
+import { UsersService } from './modules/users/users.service.js';
 
 // ============================================================
 // CRÉATION DES INSTANCES SINGLETON
@@ -58,9 +60,11 @@ export interface AppContainer {
   tokenService: TokenService;
   authService: AuthService;
 
+  // Users module
+  usersRepository: UsersRepository;
+  usersService: UsersService;
+
   // TODO: register as modules are implemented
-  // usersService: UsersService;
-  // usersRepository: UsersRepository;
   // ordersService: OrdersService;
   // ...
 }
@@ -88,6 +92,10 @@ container.register({
   authRepository: asClass(AuthRepository).scoped(),
   tokenService: asClass(TokenService).scoped(),
   authService: asClass(AuthService).scoped(),
+
+  // Users module (scoped per request)
+  usersRepository: asClass(UsersRepository).scoped(),
+  usersService: asClass(UsersService).scoped(),
 });
 
 // ============================================================
@@ -106,5 +114,9 @@ export async function disposeContainer() {
 declare module 'fastify' {
   interface FastifyRequest {
     container: AwilixContainer<AppContainer>;
+  }
+  interface FastifyInstance {
+    authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    requireAdmin: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
 }
